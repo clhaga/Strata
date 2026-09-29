@@ -632,6 +632,7 @@ struct ConvCheckpoint {
     std::vector<int32_t> ids;     ///< the tokens this state has consumed
     std::vector<ImgKey> imgs;     ///< the images among them
     std::vector<uint8_t> gdn, ple, tails;
+    std::vector<uint8_t> gdn1, tails1;   ///< DUAL-GPU: side 1's running state (empty on a single-side engine)
     uint64_t used = 0;            ///< last-use stamp for the retention policy (conv_cache.hpp)
 };
 
@@ -655,38 +656,72 @@ ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g) {
     return z;
 }
 
-/// Copies the running state out.  The caller has synchronized the device.
-bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+/// Copies ONE side's running state out (side 1's into the `*1` blobs).  The caller has synchronized THAT
+/// side's device - the sizes are the side's own layer range, because a split session's gdn_state rows and
+/// qsa_states belong to its layers only.
+bool checkpoint_save_side(ConvCheckpoint& c, const strata::core::SessionState& ss,
+                          const strata::core::ModelGeometry& g, bool second) {
+    int64_t n_gdn = 0, n_qsa = 0;
+    for (int64_t l = ss.layer_begin; l < ss.layer_end; ++l) {
+        if (strata::core::is_qsa_layer(g, l)) ++n_qsa;
+        else ++n_gdn;
+    }
     const ConvStateSizes z = conv_state_sizes(g);
-    c.gdn.resize(z.gdn);
-    c.ple.resize(ss.ple_hist != nullptr ? z.ple : 0);
-    c.tails.resize(z.tail * (size_t) g.n_qsa_layers());
-    if (cudaMemcpy(c.gdn.data(), ss.gdn_state, z.gdn, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-    if (!c.ple.empty() && cudaMemcpy(c.ple.data(), ss.ple_hist, z.ple, cudaMemcpyDeviceToHost) != cudaSuccess)
-        return false;
-    for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
-        if (cudaMemcpy(c.tails.data() + (size_t) i * z.tail, ss.qsa_states[i].idx_tail, z.tail, cudaMemcpyDeviceToHost) !=
+    const size_t gdn_bytes = (size_t) n_gdn * (z.gdn / (size_t) g.n_gdn_layers());
+    std::vector<uint8_t>& vg = second ? c.gdn1 : c.gdn;
+    std::vector<uint8_t>& vt = second ? c.tails1 : c.tails;
+    vg.resize(gdn_bytes);
+    vt.resize(z.tail * (size_t) n_qsa);
+    if (cudaMemcpy(vg.data(), ss.gdn_state, gdn_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+    if (!second) {
+        c.ple.resize(ss.ple_hist != nullptr ? z.ple : 0);   // the PLE is layer 1's: side 0's alone
+        if (!c.ple.empty() && cudaMemcpy(c.ple.data(), ss.ple_hist, z.ple, cudaMemcpyDeviceToHost) != cudaSuccess)
+            return false;
+    }
+    for (int64_t i = 0; i < n_qsa; ++i)
+        if (cudaMemcpy(vt.data() + (size_t) i * z.tail, ss.qsa_states[i].idx_tail, z.tail, cudaMemcpyDeviceToHost) !=
             cudaSuccess)
             return false;
     return true;
 }
 
-/// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
-bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+    return checkpoint_save_side(c, ss, g, false);
+}
+
+/// Puts ONE side's checkpoint back; the positional cells below it are the caller's to guarantee.
+bool checkpoint_restore_side(const ConvCheckpoint& c, strata::core::SessionState& ss,
+                             const strata::core::ModelGeometry& g, bool second) {
+    int64_t n_gdn = 0, n_qsa = 0;
+    for (int64_t l = ss.layer_begin; l < ss.layer_end; ++l) {
+        if (strata::core::is_qsa_layer(g, l)) ++n_qsa;
+        else ++n_gdn;
+    }
     const ConvStateSizes z = conv_state_sizes(g);
-    if (c.gdn.size() != z.gdn || c.tails.size() != z.tail * (size_t) g.n_qsa_layers()) return false;
-    if (cudaMemcpy(ss.gdn_state, c.gdn.data(), z.gdn, cudaMemcpyHostToDevice) != cudaSuccess) return false;
-    if (!c.ple.empty() && cudaMemcpy(ss.ple_hist, c.ple.data(), z.ple, cudaMemcpyHostToDevice) != cudaSuccess)
+    const size_t gdn_bytes = (size_t) n_gdn * (z.gdn / (size_t) g.n_gdn_layers());
+    const std::vector<uint8_t>& vg = second ? c.gdn1 : c.gdn;
+    const std::vector<uint8_t>& vt = second ? c.tails1 : c.tails;
+    if (vg.size() != gdn_bytes || vt.size() != z.tail * (size_t) n_qsa) return false;
+    if (cudaMemcpy(ss.gdn_state, vg.data(), gdn_bytes, cudaMemcpyHostToDevice) != cudaSuccess) return false;
+    if (!second && !c.ple.empty() &&
+        cudaMemcpy(ss.ple_hist, c.ple.data(), z.ple, cudaMemcpyHostToDevice) != cudaSuccess)
         return false;
-    for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
-        if (cudaMemcpy(ss.qsa_states[i].idx_tail, c.tails.data() + (size_t) i * z.tail, z.tail, cudaMemcpyHostToDevice) !=
+    for (int64_t i = 0; i < n_qsa; ++i)
+        if (cudaMemcpy(ss.qsa_states[i].idx_tail, vt.data() + (size_t) i * z.tail, z.tail, cudaMemcpyHostToDevice) !=
             cudaSuccess)
             return false;
-    // the PLE's token window is the last two tokens, OLDEST FIRST, -1 where there is none (as session_zero leaves it)
-    const size_t L = c.ids.size();
-    ss.ple_prev[0] = L >= 2 ? c.ids[L - 2] : -1;
-    ss.ple_prev[1] = L >= 1 ? c.ids[L - 1] : -1;
+    if (!second) {
+        // the PLE's token window is the last two tokens, OLDEST FIRST, -1 where there is none (as session_zero leaves it)
+        const size_t L = c.ids.size();
+        ss.ple_prev[0] = L >= 2 ? c.ids[L - 2] : -1;
+        ss.ple_prev[1] = L >= 1 ? c.ids[L - 1] : -1;
+    }
     return cudaDeviceSynchronize() == cudaSuccess;
+}
+
+bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
+                        const strata::core::ModelGeometry& g) {
+    return checkpoint_restore_side(c, ss, g, false);
 }
 
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
@@ -1194,6 +1229,9 @@ int main(int argc, char** argv) {
         int expert_cache = 0;                   ///< the slot count this side settled on (0 = none)
         std::vector<int64_t> sized_slots;       ///< a native pack's per-blob slot sizes, this side
         int64_t prefilled = 0;                  ///< profile pairs this side filled
+        std::vector<int32_t> d_res_rows;        ///< this side's residency rows (host copy, owned layers filled)
+        int32_t* d_res = nullptr;               ///< and the device copy, on THIS card
+        strata::core::VerifyHits vh;            ///< this side's verifier hit config
     };
     const int n_sides = o.split_layers > 0 ? 2 : 1;
     const int64_t n_layers_total = strata::core::ModelGeometry{}.n_layers;
@@ -1224,6 +1262,13 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: dual-GPU: layers [0, %d) on device 0, [%d, %lld) on device 1\n",
                      o.split_layers, o.split_layers, (long long) n_layers_total);
+        if (!o.serve) {
+            // v1: the split's decode and prompt paths are wired for the SERVER loop (two verifiers, two
+            // prefills, the boundary handoff); the single-shot loop still assumes one device.  Refusing
+            // beats decoding on a half-split engine - docs/DUAL-GPU.md.
+            std::fprintf(stderr, "strata generate: --split-layers currently requires --serve\n");
+            return 2;
+        }
     }
     /// `blk.<l>.` for every l outside [begin, end) - the tensors the OTHER side loads, so this side's arena
     /// holds only its own layers and the loader's compaction does the placement.
@@ -1888,20 +1933,6 @@ int main(int argc, char** argv) {
         mem_mark("the R4 hit path");
         std::fprintf(stderr, "strata generate: R4 hit path ON - resident experts are computed on the GPU\n");
     }
-    if (n_sides == 2) {
-        // **STOPPED HERE ON PURPOSE** (`docs/DUAL-GPU.md`, "What landed").  Everything above this point is
-        // two-sided - both cards have their layers' weights, their session state and their profile-filled
-        // expert caches, and the startup lines above name them per side.  Everything below (the token graph,
-        // the verify windows, the prompt path, the drafter, the conversation checkpoints) still assumes one
-        // device, and running it on a half-loaded engine would produce plausible tokens from the wrong
-        // tensors - the exact failure mode this engine refuses everywhere else.  So: refuse, loudly.
-        std::fprintf(stderr,
-            "strata generate: --split-layers: the split's decode path is not wired to the second device yet -\n"
-            "                 refusing rather than decoding on a half-split engine. The per-side loads above\n"
-            "                 (weights, session, expert caches) are the landed part; see docs/DUAL-GPU.md for\n"
-            "                 the remaining seams: the verifier's window graphs, the prompt path, the drafter.\n");
-        return 2;
-    }
     // ---- P0.S8: the routing trace.  Only meaningful with the pool running, because the ids arrive through
     // the doorbell that the pool consumes - so `--no-pool` is refused rather than silently producing an empty
     // file that would read as "the router selected nothing".
@@ -2418,17 +2449,37 @@ int main(int argc, char** argv) {
     if (graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr) {
         host_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
         int64_t resident = 0;
-        for (int64_t l = 0; l < g.n_layers; ++l)
-            for (int64_t e = 0; e < g.n_expert; ++e) {
-                const int32_t slot = xcache.slot_of(l, e);
-                host_res[(size_t) (l * g.n_expert + e)] = slot;
-                if (slot != strata::core::kNotResident) ++resident;
+        for (int64_t s = 0; s < n_sides; ++s) {
+            // DUAL-GPU: each side's table carries ITS cache's slots for ITS layers (foreign rows stay
+            // -1), allocated and uploaded on that side's device
+            DeviceGuard res_guard(sides[s].ordinal);
+            for (int64_t l = sides[s].layer_begin; l < sides[s].layer_end; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e) {
+                    const int32_t slot = sides[s].xcache.slot_of(l, e);
+                    host_res[(size_t) (l * g.n_expert + e)] = slot;
+                    if (slot != strata::core::kNotResident) ++resident;
+                }
+            sides[s].d_res_rows = host_res;   // the side's own copy, for its VerifyHits
+        }
+        {
+            DeviceGuard res_guard(sides[0].ordinal);
+            if (cudaMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
+                cudaMalloc((void**) &d_hit_count, sizeof(int32_t)) != cudaSuccess ||
+                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
+                    cudaSuccess) {
+                std::fprintf(stderr, "strata generate: the device residency table could not be staged\n");
+                return 1;
             }
-        if (cudaMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
-            cudaMalloc((void**) &d_hit_count, sizeof(int32_t)) != cudaSuccess ||
-            cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
-            std::fprintf(stderr, "strata generate: the device residency table could not be staged\n");
-            return 1;
+        }
+        // side 1's device copy of the same table (its graphs read only its rows)
+        for (int s = 1; s < n_sides; ++s) {
+            DeviceGuard res_guard(sides[s].ordinal);
+            if (cudaMalloc((void**) &sides[s].d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
+                cudaMemcpy(sides[s].d_res, host_res.data(), host_res.size() * sizeof(int32_t),
+                           cudaMemcpyHostToDevice) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: side %d's residency table could not be staged\n", s);
+                return 1;
+            }
         }
         thits.d_res = d_res;
         thits.n_expert = g.n_expert;
@@ -2555,6 +2606,20 @@ int main(int argc, char** argv) {
             return 2;
         }
         strata::prefill::Prefill sp;
+        // DUAL-GPU: side 1's prompt path, and the one reusable pinned buffer that carries each chunk's
+        // residual across the boundary (a chunk's R is T x hc x n_embd - 320 MB at an 8192 chunk, so ONE
+        // buffer, refilled per chunk, never one per chunk)
+        strata::prefill::Prefill sp1;
+        float* split_r_buf = nullptr;
+        if (n_sides == 2) {
+            if (cudaHostAlloc((void**) &split_r_buf, (size_t) o.prefill_chunk * g.hc * g.n_embd * 4,
+                              cudaHostAllocDefault) != cudaSuccess) {
+                std::fprintf(stderr, "strata serve: the split boundary buffer (%lld tokens) failed\n",
+                             (long long) o.prefill_chunk);
+                return 1;
+            }
+        }
+        strata::prefill::Prefill* const sps[2] = {&sp, n_sides == 2 ? &sp1 : nullptr};
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -2562,7 +2627,9 @@ int main(int argc, char** argv) {
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card the
         // cache already filled to its reserve, that is the over-subscription the auto sizing avoids - so the
         // prompt chunk is halved until its buffers fit in the lendable slots (a smaller chunk only reads slower)
-        if (!o.no_prefill_borrow && d_res != nullptr) {
+        // (a split does not lend yet: each side's cache is its own, and the per-side lending is a later
+        // refinement - the non-borrow path's chunk reserve keeps the buffers inside the card)
+        if (n_sides == 1 && !o.no_prefill_borrow && d_res != nullptr) {
             int64_t chunk = o.prefill_chunk;
             if (const int64_t k = plan_lend(chunk); k > 0) {
                 if (o.prefill_auto)
@@ -2586,9 +2653,16 @@ int main(int argc, char** argv) {
                          (long long) (xcache.slots() - lend_first), (double) borrow_bytes / 1073741824.0);
         else
             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
-        if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
-            std::fprintf(stderr, "strata serve: %s\n", err.c_str());
-            return 1;
+        for (int s = 0; s < n_sides; ++s) {
+            DeviceGuard pf_guard(sides[s].ordinal);
+            const void* s_borrow = (s == 0) ? borrow : nullptr;
+            const uint64_t s_borrow_bytes = (s == 0) ? borrow_bytes : 0;
+            if (!sps[s]->init(sides[s].wt, g, sides[s].ss, srcp, &sides[s].xcache,
+                              host_res.data(), o.prefill_chunk, sides[s].stream, err,
+                              (void*) s_borrow, s_borrow_bytes)) {
+                std::fprintf(stderr, "strata serve: side %d's prompt path: %s\n", s, err.c_str());
+                return 1;
+            }
         }
         mem_mark("the head and the prompt path");
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
@@ -2604,17 +2678,47 @@ int main(int argc, char** argv) {
             return 1;
         }
         strata::core::Verifier ver;
+        strata::core::Verifier ver1;
+        strata::core::Verifier* const vers[2] = {&ver, n_sides == 2 ? &ver1 : nullptr};
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err) ||
-            !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
-            std::fprintf(stderr, "strata serve: %s\n", err.c_str());
-            return 1;
+        {
+            // DUAL-GPU: one verifier per side, each on ITS device with ITS table/session/hits; the head and
+            // the out buffer exist only on the side that owns the last layer.  Single side: the historic call.
+            if (n_sides == 1) {
+                if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err) ||
+                    !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
+                    std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                    return 1;
+                }
+            } else {
+                for (int s = 0; s < n_sides; ++s) {
+                    DeviceGuard v_guard(sides[s].ordinal);
+                    strata::core::VerifyHits vs;
+                    vs.d_res = s == 0 ? d_res : sides[s].d_res;
+                    vs.cache_base = (const uint8_t*) sides[s].xcache.device_slot(0);
+                    vs.blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+                    sides[s].vh = vs;
+                    if (!vers[s]->init(sides[s].wt, g, sides[s].ss, vs,
+                                       native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+                        std::fprintf(stderr, "strata serve: side %d's verifier: %s\n", s, err.c_str());
+                        return 1;
+                    }
+                }
+                ver1.set_input_external();
+                if (!mtp.bind(sides[1].wt, &native_head, ver1.final_R_all(), err)) {
+                    std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                    return 1;
+                }
+            }
         }
         mem_mark("the verifier and the drafter's binding");
         ver.set_split(o.spec_split);
+        if (n_sides == 2) ver1.set_split(o.spec_split);
+        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        if (n_sides == 2) ver1.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
@@ -2649,7 +2753,11 @@ int main(int argc, char** argv) {
             ConvCheckpoint c;
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
-            if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
+            for (int s = 0; s < n_sides; ++s) {
+                DeviceGuard ck(sides[s].ordinal);
+                if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save_side(c, sides[s].ss, g, s > 0))
+                    return false;
+            }
             c.used = ++check_clock;
             checks.push_back(std::move(c));
             while ((int) checks.size() > o.prompt_cache) {
@@ -2662,7 +2770,12 @@ int main(int argc, char** argv) {
             }
             return true;
         };
-        sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+        // DUAL-GPU: side 0's on_chunk is only the boundary - the chunk's residual to the pinned buffer,
+        // then side 1 runs the same chunk (its own prefill) - and side 1's on_chunk is the ORIGINAL
+        // handler, where R_rows is the FINAL residual after layer 47 (the MTP feed and the checkpoints
+        // want exactly that).  One buffer, refilled per chunk.
+        std::function<bool(const float*, int64_t, int64_t, std::string&)> on_chunk_final =
+            [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
             if (!mtp.prefill(R_rows, nxt.data(), T, p0, e)) return false;
@@ -2680,9 +2793,72 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        sp.on_chunk = on_chunk_final;
+        if (n_sides == 2) {
+            sp.on_chunk = [&, T_max = o.prefill_chunk](const float* R_rows, int64_t T, int64_t p0,
+                                                       std::string& e) -> bool {
+                if (cudaMemcpy(split_r_buf, R_rows, (size_t) T * g.hc * g.n_embd * 4, cudaMemcpyDeviceToHost) !=
+                    cudaSuccess) {
+                    e = "the split boundary residual copy failed";
+                    return false;
+                }
+                sp1.set_external_r(split_r_buf, T_max);
+                return sp1.run(cur.data() + p0, T, p0, e);
+            };
+            sp1.on_chunk = on_chunk_final;
+        }
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
-        if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        if (o.adapt_every > 0 && o.adapt_swaps > 0 && n_sides == 1)
+            drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        // DUAL-GPU: the second dispatch serves side 1's layers - same pool and source (the windows are
+        // serial, so the CPU workers never serve both sides at once), side 1's cache and plan sink, and
+        // the SAME combined residency table (each layer's rows name the owning side's slots, and the
+        // callback hands the dispatch the GLOBAL layer, so nothing here re-decides by side).  The
+        // adaptive tier stays single-side for now (its swap path is not side-aware).
+        Drive drive1;
+        Drive* const drives[2] = {&drive, n_sides == 2 ? &drive1 : nullptr};
+        if (n_sides == 2) {
+            drive1.d.pool = drive.d.pool;
+            drive1.d.src = drive.d.src;
+            drive1.d.n_expert = drive.d.n_expert;
+            drive1.d.jobs.resize(drive.d.jobs.size());
+            drive1.d.host_res = drive.d.host_res;
+            drive1.d.cache = &sides[1].xcache;
+            drive1.d.cache_stream = sides[1].stream;
+            drive1.d.cache_base = (const uint8_t*) sides[1].xcache.device_slot(0);
+            drive1.d.cache_blob = drive.d.cache_blob;
+            drive1.d.cache_slot_off = sides[1].xcache.slot_offsets();
+            drive1.d.hit_scratch = drive.d.hit_scratch;
+            drive1.d.parts_out = sides[1].parts_dev;
+            drive1.d.hit_out = drive.d.hit_out;
+            drive1.d.parts_elems = drive.d.parts_elems;
+            drive1.d.split_rows = drive.d.split_rows;
+            drive1.d.hit_cpu_order = drive.d.hit_cpu_order;
+            drive1.d.hit_poke = drive.d.hit_poke;
+            drive1.d.plan = ver1.plan_sink();
+            drive1.d.pcie_num = drive.d.pcie_num;
+        }
+        // DUAL-GPU: a window through BOTH sides - side 0's half (its run() ends with a sync; `out` is
+        // dummy, its graphs have no head), the boundary state across, side 1's half with the real `out`.
+        // The pool callback receives the GLOBAL layer, so each dispatch finds its own rows without any
+        // switching logic here.
+        auto run_window = [&](int T, const int32_t* win, int64_t p, int32_t* out, std::string& e) -> bool {
+            if (n_sides == 1)
+                return ver.run(T, win, p, &drive_pool_multi, &drive, out, e) && !drive.d.failed;
+            int32_t dummy[8] = {0};
+            if (!ver.run(T, win, p, &drive_pool_multi, &drive, dummy, e) || drive.d.failed) return false;
+            if (!ver1.adopt_state(ver, T, e)) return false;
+            return ver1.run(T, win, p, &drive_pool_multi, &drive1, out, e) && !drive1.d.failed;
+        };
+        auto commit_window = [&](int n_keep, std::string& e) -> bool {
+            if (n_sides == 2) {
+                DeviceGuard c1(sides[1].ordinal);
+                if (!ver1.commit(n_keep, e)) return false;
+            }
+            DeviceGuard c0(sides[0].ordinal);
+            return ver.commit(n_keep, e);
+        };
         cudaStream_t adapt_stream = nullptr;
         if (cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
             std::fprintf(stderr, "strata serve: cannot create the refill stream\n");
@@ -3078,8 +3254,11 @@ int main(int argc, char** argv) {
             live_ok = false;   // until this request has finished, the session is in between
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
-                strata::core::session_zero(ss, g, nullptr, main_cs);
-                cudaStreamSynchronize(main_stream);
+                for (int s = 0; s < n_sides; ++s) {
+                    DeviceGuard sz(sides[s].ordinal);
+                    strata::core::session_zero(sides[s].ss, g, nullptr, sides[s].stream);
+                    cudaStreamSynchronize(sides[s].stream);
+                }
                 checks.clear();
             } else if (!from_live) {
                 ConvCheckpoint* c = nullptr;
@@ -3092,12 +3271,22 @@ int main(int argc, char** argv) {
                     // that saved it read them in, when that request started at 0.  With the VRAM expert set fixed
                     // (--adapt-swaps 0) the answer must match the restored one token for token; anything the
                     // checkpoint missed shows up as a difference.
-                    strata::core::session_zero(ss, g, nullptr, main_cs);
-                    cudaStreamSynchronize(main_stream);
+                    for (int s = 0; s < n_sides; ++s) {
+                        DeviceGuard sz(sides[s].ordinal);
+                        strata::core::session_zero(sides[s].ss, g, nullptr, sides[s].stream);
+                        cudaStreamSynchronize(sides[s].stream);
+                    }
                     reread_to = resume;
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
                                          "restoring\n", (long long) resume);
-                } else if (c == nullptr || !checkpoint_restore(*c, ss, g)) {
+                } else if (c == nullptr ||
+                           ![&]() {
+                               for (int s = 0; s < n_sides; ++s) {
+                                   DeviceGuard ck(sides[s].ordinal);
+                                   if (!checkpoint_restore_side(*c, sides[s].ss, g, s > 0)) return false;
+                               }
+                               return true;
+                           }()) {
                     std::printf("ERR restoring a conversation checkpoint failed\n");
                     return 1;
                 }
@@ -3138,6 +3327,8 @@ int main(int argc, char** argv) {
                     explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
                     ~NoHeadSampling() { v.set_head_sampling(true); }
                 } no_head_sampling(ver);
+                std::unique_ptr<NoHeadSampling> no_head_sampling1;
+                if (n_sides == 2) no_head_sampling1 = std::make_unique<NoHeadSampling>(ver1);
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
                 for (int64_t q = a; q < b;) {
                     if (stop_req.load()) { e = "cancelled"; return false; }
@@ -3149,11 +3340,19 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
-                    if (!ver.run(T, win.data(), q, &drive_pool_multi, &drive, outw.data(), e) || drive.d.failed) {
+                    if (n_sides == 2) {
+                        drive1.d.layers = 0;
+                        drive1.d.experts = 0;
+                        drive1.d.failed = false;
+                    }
+                    if (!run_window(T, win.data(), q, outw.data(), e)) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
+                        if (n_sides == 2 && drive1.d.failed && drive1.d.fail) e = drive1.d.fail;
                         return false;
                     }
-                    if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
+                    if (!commit_window(T, e) ||
+                        !mtp.prefill((n_sides == 2 ? ver1 : ver).final_R_all(), nxt.data(), T, q, e))
+                        return false;
                     q += T;
                 }
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
@@ -3221,9 +3420,11 @@ int main(int argc, char** argv) {
             req_sp.penalty_present = req_penalty_present;
             req_sp.counter = 0;
             ver.set_sampling(req_sp);
+            if (n_sides == 2) ver1.set_sampling(req_sp);
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
+            if (n_sides == 2) ver1.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
             tr("prompt start", n - 1);
             // The prompt is read in two parts when it has a turn boundary past `resume`: up to the last <|im_start|>
@@ -3338,6 +3539,11 @@ int main(int argc, char** argv) {
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
+                if (n_sides == 2) {
+                    drive1.d.layers = 0;
+                    drive1.d.experts = 0;
+                    drive1.d.failed = false;
+                }
                 apply_pending(false);
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
@@ -3350,8 +3556,10 @@ int main(int argc, char** argv) {
                                cudaMemcpyHostToDevice);
                 }
                 tr("window", p, T);
-                if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err) || drive.d.failed) {
-                    std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                if (!run_window(T, window.data(), p, outv.data(), err)) {
+                    const char* dfail = drive.d.failed && drive.d.fail ? drive.d.fail
+                                      : (n_sides == 2 && drive1.d.failed && drive1.d.fail) ? drive1.d.fail : nullptr;
+                    std::printf("ERR %s\n", dfail ? dfail : err.c_str());
                     return 1;
                 }
                 int a = 0;
@@ -3361,7 +3569,7 @@ int main(int argc, char** argv) {
                 bool adapt_ok = true;
                 if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] { adapt_ok = adapt(); });
-                if (!ver.commit(a + 1, err)) {
+                if (!commit_window(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
