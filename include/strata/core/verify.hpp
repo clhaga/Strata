@@ -89,6 +89,22 @@ public:
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
 
+    // ================================ DUAL-GPU (`docs/DUAL-GPU.md`) ================================
+    //
+    // A split decode runs TWO verifiers - side 0 over layers [0, N), side 1 over [N, 48) - and the DRIVER
+    // orchestrates them: side 0's run() finishes with `cudaStreamSynchronize`, the boundary state crosses,
+    // side 1's run() launches.  What crosses is the residual R AND the pending FFN write (bo_, inj2_) that
+    // the next side's first `gr_read` folds in - three buffers, ~200 KB per window at T=4.  Each verifier's
+    // ring/flag counters are its own, so the halves need no shared numbering.
+    /// True when this verifier owns the LAST layer - i.e. it records the head, samples and fills `out`.
+    bool is_last_side() const { return g_ != nullptr && ss_ != nullptr && ss_->layer_end >= g_->n_layers; }
+    /// This side's window starts from an externally supplied residual instead of the token embedding - set
+    /// BEFORE the first run() (the capture bakes the structure).
+    void set_input_external() { external_R_ = true; }
+    /// Pulls the boundary state (R_, bo_, inj2_) from `prev`'s completed window into this side's buffers,
+    /// stream-ordered on this side's stream ahead of the next graph launch.
+    bool adopt_state(const Verifier& prev, int T, std::string& err);
+
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return R_; }
@@ -162,6 +178,8 @@ private:
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
+    bool external_R_ = false;   // dual-GPU: set_input_external()
+    int dev_ = 0;               ///< dual-GPU: the device this verifier's arena lives on (set at init)
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 

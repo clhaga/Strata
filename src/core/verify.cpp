@@ -162,11 +162,20 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     max_blocks_ = ss.qsa_states[0].max_cells / s.idx_block + 2;
     attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
 
+    cudaGetDevice(&dev_);   // dual-GPU: run() 's boundary copies name this ordinal explicitly
+    // dual-GPU: this verifier's scratch is sized for ITS side's layers only; the head (and its T x n_vocab
+    // logits buffer, ~150 MB) exists only on the side that owns the last layer
+    int64_t n_gdn_side = 0, n_qsa_side = 0;
+    for (int64_t l = ss.layer_begin; l < ss.layer_end; ++l) {
+        if (is_qsa_layer(g, l)) ++n_qsa_side;
+        else ++n_gdn_side;
+    }
+    const bool last_side = ss.layer_end >= g.n_layers;
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
     const uint64_t C = (uint64_t) g.ssm_conv_channels, ZV = (uint64_t) g.ssm_value_dim, HV = (uint64_t) g.ssm_v_heads;
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
     const uint64_t IQ = (uint64_t) g.idx_q_heads, ID = (uint64_t) g.idx_key_dim;
-    const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers();
+    const uint64_t nG = (uint64_t) n_gdn_side, nQ = (uint64_t) n_qsa_side;
     const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
@@ -242,7 +251,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
-        head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
+        head_logits_ = b.take<float>(last_side ? T * (uint64_t) n_vocab_ : 0);
         hist_snap_ = b.take<float>(T * HS);
     };
     Bump count;
@@ -266,8 +275,27 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: stream create failed";
         return false;
     }
-    std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
-                 (double) count.used / 1048576.0);
+    std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers, layers [%lld, %lld)%s\n",
+                 max_t, (double) count.used / 1048576.0, (long long) ss.layer_begin, (long long) ss.layer_end,
+                 last_side ? "" : " - one side of a split, no head");
+    return true;
+}
+
+// ---- dual-GPU: the boundary state.  `prev`'s window has completed (its run() synchronised before the driver
+// calls this), so three plain peer copies on THIS side's stream, ahead of the next graph launch, are the whole
+// handoff.  R_ is the residual; bo_/inj2_ are the pending FFN write that this side's first gr_read folds in -
+// losing them would silently skip a layer's contribution, which is the plausible-token failure this engine
+// refuses everywhere else, so the byte counts are asserted rather than trusted.
+bool Verifier::adopt_state(const Verifier& prev, int T, std::string& err) {
+    if (prev.last_t_ != T) { err = "verify: the boundary handoff needs the previous side's window size"; return false; }
+    const int64_t N = g_->n_embd, HC = g_->hc;
+    const cudaError_t e1 = cudaMemcpyPeerAsync(R_, dev_, prev.R_, prev.dev_, (size_t) T * HC * N * 4, cs_);
+    const cudaError_t e2 = cudaMemcpyPeerAsync(bo_, dev_, prev.bo_, prev.dev_, (size_t) T * N * 4, cs_);
+    const cudaError_t e3 = cudaMemcpyPeerAsync(inj2_, dev_, prev.inj2_, prev.dev_, (size_t) T * HC * 4, cs_);
+    if (e1 != cudaSuccess || e2 != cudaSuccess || e3 != cudaSuccess) {
+        err = std::string("verify: the boundary copy failed: ") + cudaGetErrorString(e1 != cudaSuccess ? e1 : (e2 != cudaSuccess ? e2 : e3));
+        return false;
+    }
     return true;
 }
 
@@ -309,8 +337,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * NH, cs);
     if (ple_on) copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
 
-    // ---- the embeddings, broadcast to the hc streams
-    if (const NativeEmbed* ne = native_embed()) {       // plan v0.3 P6: the GGUF-form table
+    // ---- the embeddings, broadcast to the hc streams.  A split side 1 does neither: its R_ arrives from
+    // side 0 through `adopt_state`, stream-ordered ahead of this graph's launch.
+    if (external_R_) {
+        // nothing: R_ is already the boundary state
+    } else if (const NativeEmbed* ne = native_embed()) {       // plan v0.3 P6: the GGUF-form table
         ne->gather_dev(tok_, T, emb_, cs);
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
     } else {
@@ -329,11 +360,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
     }
 
-    // per-layer state indices (GDN and QSA layers are numbered separately)
+    // per-layer state indices (GDN and QSA layers are numbered separately) - RANGE-LOCAL, because this
+    // side's gdn_state rows and qsa_states entries are its own carve
     std::vector<int64_t> gdn_idx((size_t) g.n_layers, -1), qsa_idx((size_t) g.n_layers, -1);
     {
         int64_t qi = 0, gi = 0;
-        for (int64_t l = 0; l < g.n_layers; ++l) {
+        for (int64_t l = ss.layer_begin; l < ss.layer_end; ++l) {
             if (is_qsa_layer(g, l)) qsa_idx[(size_t) l] = qi++;
             else gdn_idx[(size_t) l] = gi++;
         }
@@ -353,8 +385,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!wn[h] || !wd[h] || !wu[h] || !wi[h]) return false;
         }
         // the previous layer's FFN write, folded into this layer's first read (a control vector after it has
-        // already applied it)
-        bool pending = l > 0 && !cvec().covers(l - 1);
+        // already applied it).  For a split side's FIRST layer the write is side 0's bo_/inj2_, which
+        // `adopt_state` copied in - the fold happens here exactly as it does within one side.
+        bool pending = l > ss.layer_begin && !cvec().covers(l - 1);
         if (l == 1 && ple_on) {
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
             for (int t = tb; t < te; ++t) {
@@ -592,7 +625,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
             if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
         }
-        if (l == g.n_layers - 1) {
+        if (l == ss.layer_end - 1) {   // this SIDE's last layer; for side 0 of a split, the boundary state
             for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
             if (cvec().covers(l)) cvec_apply(Rt(tb), l, n, HC * N, nullptr, 0, nullptr, 0, false, cs);
         } else if (cvec().covers(l)) {
@@ -602,15 +635,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     };
 
     for (int grp = 0; grp < G; ++grp)
-        if (!pre(0, grp)) return false;
-    for (int64_t l = 0; l < g.n_layers; ++l)
+        if (!pre(ss.layer_begin, grp)) return false;
+    for (int64_t l = ss.layer_begin; l < ss.layer_end; ++l)
         for (int grp = 0; grp < G; ++grp) {
             if (!post(l, grp)) return false;
-            if (l + 1 < g.n_layers && !pre(l + 1, grp)) return false;
+            if (l + 1 < ss.layer_end && !pre(l + 1, grp)) return false;
         }
 
-    // ---- the head, T columns, and the argmax of each
-    {
+    // ---- the head, T columns, and the argmax of each - ONLY on the side that owns the last layer; the
+    // other side's window ends at its final residual, which `adopt_state` hands across the boundary
+    if (is_last_side()) {
         const WeightRef *hn = wt.find("output_hc_norm.weight"), *hd = wt.find("output_hc_down.weight"),
                         *hu = wt.find("output_hc_up.weight");
         if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
@@ -695,7 +729,7 @@ bool Verifier::capture_commit(std::string& err) {
     try {
         copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
-        for (int64_t l = 0; l < g.n_layers && ok; ++l) {
+        for (int64_t l = ss.layer_begin; l < ss.layer_end && ok; ++l) {   // this side's layers only
             const LayerView v(*wt_, l);
             if (!is_qsa_layer(g, l)) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);
@@ -785,8 +819,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     volatile uint32_t* const flag = h_flag_;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
-    for (int64_t k = 0; k < g.n_layers * G; ++k) {
-        const int64_t l = k / G;
+    // dual-GPU: the loop serves THIS side's layers; `l` stays the GLOBAL layer number because the pool
+    // dispatch resolves its side's caches by it, while the ring numbers are this verifier's own.
+    const int64_t n_side_layers = ss.layer_end - ss.layer_begin;
+    for (int64_t k = 0; k < n_side_layers * G; ++k) {
+        const int64_t l = ss.layer_begin + k / G;
         const int grp = (int) (k % G);
         const uint32_t want = (uint32_t) (k + 1);
         const Clock::time_point a = Clock::now();
@@ -840,6 +877,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+    if (!is_last_side()) {
+        // dual-GPU: side 0's half is done - its R_/bo_/inj2_ are the boundary state the driver adopts into
+        // side 1 before launching that side's window.  No head, no out, no sampling here.
+        ++windows;
+        return true;
+    }
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
