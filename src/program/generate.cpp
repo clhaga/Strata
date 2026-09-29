@@ -1270,7 +1270,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: dual-GPU: visible device %d: properties unavailable\n", d);
                 continue;
             }
-            std::fprintf(stderr, "strata generate: dual-GPU: visible device %d: %s, %.0f MiB of VRAM (sm_%d)%\n", d,
+            std::fprintf(stderr, "strata generate: dual-GPU: visible device %d: %s, %.0f MiB of VRAM (sm_%d)\n", d,
                          prop.name, (double) prop.totalGlobalMem / 1048576.0, prop.major * 10 + prop.minor);
         }
         if (!o.serve) {
