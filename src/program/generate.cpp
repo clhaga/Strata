@@ -3348,8 +3348,11 @@ int main(int argc, char** argv) {
             if (resume == 0) {
                 for (int s = 0; s < n_sides; ++s) {
                     DeviceGuard sz(sides[s].ordinal);
+                    std::fprintf(stderr, "strata serve: zeroing side %d (device %d) for the new sequence\n",
+                                 s, sides[s].ordinal);
                     strata::core::session_zero(sides[s].ss, g, nullptr, sides[s].stream);
                     cudaStreamSynchronize(sides[s].stream);
+                    std::fprintf(stderr, "strata serve: side %d zeroed\n", s);
                 }
                 checks.clear();
             } else if (!from_live) {
