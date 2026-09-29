@@ -53,6 +53,18 @@ which cuts the exposed CPU expert term (`expert_cache.hpp:3`, the largest single
    feed) wires to SIDE 1'S instance only - it must see the residual AFTER side 1's layers; the
    cache-slot borrowing/lending (`lend_slots`/`plan_lend`/`Prefill::relayout`) becomes per side.
    The driver runs side 0's chunk then side 1's chunk per prompt chunk with the handoff between.
+
+   **THE STRUCTURAL CHANGE `run()` NEEDS** (decided, not yet done): the chunk loop body
+   (`prefill.cpp:752`'s `for (int64_t c0 = 0; c0 < n; c0 += m.T)`, ~500 lines) extracts verbatim into
+   `bool run_one_chunk(int64_t c0, int64_t n, const int32_t* tokens, ...)`; `run()` becomes a plain loop
+   over it (byte-identical behavior). The split driver then loops chunks ITSELF: `pf0.run_one_chunk`,
+   copy `m.R` (T x hc x n_embd) peer-to-peer, `pf1.run_one_chunk`. Supporting pieces: `external_R_`
+   (skip the embedding broadcast + PLE row gather - side 1's `ss.ple` is not even wired, and `ple_on`
+   reads `ss.ple.ready()` so it is naturally false there... VERIFY that `ple_on` is computed from THIS
+   side's ss), `float* R_dev()` and `int dev_` accessors (as verify.cpp's `adopt_state` does), and the
+   per-chunk expert-stream pre-pass walks (`prefill.cpp:810` `for l in 0..g.n_layers` building the ring
+   sequence, `seq_start[l]`) restricted to the side's range - `seq_start` stays n_layers+1-sized with
+   foreign layers empty.
 6. **`mtp.{cpp,hpp}`**: the drafter is placed on the last side (its `load` is already DeviceGuarded
    there; `bind(wt, ...)` must take the last side's table and the side-1 verifier's `final_R_all()`).
 7. **`expert_source.hpp` / `ExpertDispatch`**: a second pointer set (parts/hit/cache) selected by its
