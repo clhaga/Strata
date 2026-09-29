@@ -28,6 +28,9 @@
 #include <atomic>
 #include <chrono>
 #if defined(_WIN32)
+#ifndef NOMINMAX   // windows.h's min/max macros mangle every std::min/std::max below (generate.cpp:52's rule)
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 #include <cstdio>
