@@ -133,10 +133,24 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds) : 
     if (bytes == 0) return;
     base = reserve(bytes, backing, note);
 
+    // **DUAL-GPU: A CAP ON HOW MUCH IS REGISTERED** (`STRATA_ARENA_REGISTER_GB`, set by the driver when it
+    // splits across two cards).  cudaHostRegister PORTABLE maps the region into EVERY device context, and on
+    // WDDM the per-context mapping of ~8 million 4 KB pages costs driver-pinned kernel memory per context -
+    // with two contexts the registration loop consumed the whole budget, stopped at 31 of 40 GiB, and left
+    // the driver unable to service ANY new allocation (cudaMalloc AND cudaMemGetInfo returning out of memory
+    // with GBs of VRAM and commit free).  The unregistered remainder stays ordinary RAM: the CPU pool reads
+    // it exactly as before; only the GPU's over-PCIe share of missed experts shrinks to the capped prefix.
+    uint64_t reg_budget = bytes;
+    if (const char* env = std::getenv("STRATA_ARENA_REGISTER_GB"); env != nullptr) {
+        const int64_t gb = std::atoll(env);
+        if (gb > 0) reg_budget = std::min<uint64_t>(bytes, (uint64_t) gb << 30);
+        note = "registration capped at " + std::to_string((unsigned long long) (reg_budget >> 30)) + " GiB; " + note;
+    }
+
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
     if (base) {
-        const cudaError_t e = cudaHostRegister(base, (size_t) bytes, cudaHostRegisterPortable | cudaHostRegisterMapped);
+        const cudaError_t e = cudaHostRegister(base, (size_t) reg_budget, cudaHostRegisterPortable | cudaHostRegisterMapped);
         if (e == cudaSuccess) {
             note = "cudaHostRegister PORTABLE ok; " + note;
             registered_bytes = bytes;
@@ -146,12 +160,14 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds) : 
             slice_bytes = 1;   // sliced; the uniform constructor records the size
             for (size_t i = 0; i + 1 < bounds.size(); ++i) {
                 const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];
-                if (cudaHostRegister((uint8_t*) base + off, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+                if (off >= reg_budget) break;   // the cap: leave the driver its pinned budget
+                if (cudaHostRegister((uint8_t*) base + off, (size_t) std::min<uint64_t>(n, reg_budget - off),
+                                     cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
                     (void) cudaGetLastError();
                     break;
                 }
                 slice_starts.push_back(off);
-                registered_bytes = off + n;
+                registered_bytes = std::min<uint64_t>(off + n, reg_budget);
                 ++registered_slices;
             }
             note = "cudaHostRegister of the whole arena FAILED (" + std::string(cudaGetErrorString(e)) + "); " +

@@ -1262,6 +1262,23 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: dual-GPU: layers [0, %d) on device 0, [%d, %lld) on device 1\n",
                      o.split_layers, o.split_layers, (long long) n_layers_total);
+        // THE ARENA'S PINNED REGISTRATION, CAPPED FOR TWO CONTEXTS: cudaHostRegister PORTABLE maps the arena
+        // into BOTH devices, and on WDDM the second context's mapping of the same ~8M pages costs about as
+        // much driver-pinned budget again.  Uncapped, the registration loop exhausted the budget at 31 GiB
+        // and left the driver refusing every new allocation (cudaMalloc and even cudaMemGetInfo "out of
+        // memory" with GBs free).  12 GiB into two contexts ~= 24 effective single-context GiB, safely under
+        // what a single-card run registers.  The unregistered remainder is plain RAM: the CPU expert pool is
+        // unchanged; only the GPU's over-PCIe share of misses shrinks to the capped prefix.  Override with
+        // STRATA_ARENA_REGISTER_GB.
+        if (std::getenv("STRATA_ARENA_REGISTER_GB") == nullptr) {
+#if defined(_WIN32)
+            _putenv("STRATA_ARENA_REGISTER_GB=12");
+#else
+            setenv("STRATA_ARENA_REGISTER_GB", "12", 0);
+#endif
+            std::fprintf(stderr, "strata generate: dual-GPU: expert arena registration capped at 12 GiB "
+                                 "(two device contexts; STRATA_ARENA_REGISTER_GB overrides)\n");
+        }
         // THE GROUND TRUTH ABOUT WHAT CUDA SEES, BY NAME AND VRAM: the iGPUs of Device Manager never appear
         // here (CUDA enumerates NVIDIA hardware only), so this line settles any labelling question outright.
         for (int d = 0; d < visible; ++d) {
