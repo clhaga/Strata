@@ -35,13 +35,9 @@ which cuts the exposed CPU expert term (`expert_cache.hpp:3`, the largest single
    `set_input_external()` + `adopt_state(prev, T)` carry the boundary (`R_`, `bo_`, `inj2_`); the head/
    sampling/`out` exist only on the last side; `run()`'s pool callback still receives the GLOBAL layer
    number. What remains HERE: nothing inside verify.cpp - the generate.cpp driver (item 8) instantiates
-   and orchestrates the pair. `Verifier::init(wt, g, ss, hits,
-   head, spec, err)` and `record_window` assume one device. Split: record the window per side into two
-   `exec_[T]` tables (capture stream per side), `run()` launches side 0's half, serves its rings/pool/
-   flags, then `cudaEventRecord` on side 0's stream + `cudaStreamWaitEvent` on side 1's + a peer copy of
-   the window's `R` (T rows x hc x n_embd) + side 1's half. The `VerifyHits` (d_res/cache_base/hit
-   buffers) become per side; `emb_` stays side 0; `R_`/sampler/logits on side 1; `commit()` per side.
-   The doorbell/flag protocol needs no change - seq is global and the halves are device-serialized.
+   and orchestrates the pair: `vers[0].run(...)` (syncs at its end), `vers[1].adopt_state(vers[0], T)`,
+   `vers[1].run(...)` (samples and fills `out`); `commit(n_keep)` on BOTH; `set_sampling`/`set_history`/
+   `set_head_sampling` on side 1 only.
 5. **`prefill.{cpp,hpp}`** (READ: the chunk forward is `for l in 0..n_layers` at `prefill.cpp:855` with
    `gdn_index`/`qsa_index` locals, `ss.gdn_state + gdn_index*gdn_floats`, `ss.qsa_states[qsa_index]`,
    weights via `LayerView(*m.wt, l)`, chunk activations in `m.R` (T rows x hc*n_embd); the embeddings
