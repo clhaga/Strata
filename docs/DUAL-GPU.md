@@ -191,5 +191,7 @@ P6 server/setup/docs/bench (7-8).
    VRAM via nvidia-smi should show both cards near-full expert caches.
 4. Through the server: re-run setup with `--gpus 0,1` (writes the config + the flag), or start the
    server with `--gpus 0,1 --split-layers 24`.
-Known-unsplit (safe fallbacks, all gated off or refused): single-shot generate, cache lending, the
-adaptive tier, vision-encoder GPU choice, per-card telemetry.
+Known-unsplit (safe fallbacks, all gated off or refused): single-shot generate, the adaptive tier,
+vision-encoder GPU choice, per-card telemetry.  (Cache borrowing/lending became per-side when the
+non-borrow path turned out to leave the prompt path no VRAM: each side's prefill borrows the tail of
+its own cache for the common chunk, and the tighter card sets that chunk.)

@@ -2592,28 +2592,32 @@ int main(int argc, char** argv) {
             }
         strata::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
     }
-    auto lend_slots = [&](int64_t c) -> int64_t {
-        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, c);
+    // DUAL-GPU: the lending helpers are PER SIDE - each side's prompt path borrows the tail of ITS cache,
+    // sized by ITS session's KV staging needs (side defaults to 0 for the single-side callers).
+    auto lend_slots = [&](int64_t c, int side = 0) -> int64_t {
+        const strata::core::ExpertCache& xc = sides[side].xcache;
+        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, sides[side].ss, c);
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
-        if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
+        if (xc.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
             k = 0;
-            while (k < xcache.slots() &&
-                   (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
+            while (k < xc.slots() &&
+                   (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[xc.slots() - k]) < need) ++k;
         }
         return k;
     };
-    auto lend_bytes = [&](int32_t first) -> uint64_t {
-        return xcache.slot_offsets() ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[first])
-                                     : (uint64_t) (xcache.slots() - first) *
-                                           (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+    auto lend_bytes = [&](int32_t first, int side = 0) -> uint64_t {
+        const strata::core::ExpertCache& xc = sides[side].xcache;
+        return xc.slot_offsets() ? (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[first])
+                                 : (uint64_t) (xc.slots() - first) *
+                                       (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
     };
     // The prompt path's chunk and the slots it borrows for its buffers: the requested chunk halved until it fits,
     // or with --prefill auto the largest of kAutoChunks whose buffers take at most kAutoLendPct % of the slots (a
     // lent slot's expert is streamed during the prompt and refilled after it; measured on a 12 GB card, 32K Q2_0
     // prompt: 4096 791 tok/s, 6144 878, 8192 973 with 69% of the slots lent).  A request lends only what its own
     // prompt needs (Prefill::relayout), so a big chunk costs short prompts nothing.  0 = none fits.
-    auto plan_lend = [&](int64_t& chunk) -> int64_t {
+    auto plan_lend = [&](int64_t& chunk, int lend_side) -> int64_t {
         static constexpr int64_t kAutoChunks[] = {8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
         // at 8192-token chunks nearly every expert streams anyway, so a lent slot costs little: 90% when the
         // copies are DMA from pinned RAM (Q2_0 8192 + a 384-slot ring: 1283 tok/s), 85% when host copies are the
@@ -2623,17 +2627,18 @@ int main(int argc, char** argv) {
             return v ? (int64_t) std::atoi(v)
                      : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
         }();
-        auto slots_for = lend_slots;
+        auto slots_for = [&](int64_t c) { return lend_slots(c, lend_side); };
+        const strata::core::ExpertCache& xc = sides[lend_side].xcache;
         if (o.prefill_auto) {
             for (const int64_t c : kAutoChunks) {
                 const int64_t k = slots_for(c);
-                if (k + 128 <= xcache.slots() && k * 100 <= kAutoLendPct * xcache.slots()) { chunk = c; return k; }
+                if (k + 128 <= xc.slots() && k * 100 <= kAutoLendPct * xc.slots()) { chunk = c; return k; }
             }
             return 0;
         }
         for (int64_t c = chunk; c >= 256; c /= 2) {
             const int64_t k = slots_for(c);
-            if (k + 128 <= xcache.slots()) { chunk = c; return k; }
+            if (k + 128 <= xc.slots()) { chunk = c; return k; }
         }
         return 0;
     };
@@ -2663,26 +2668,49 @@ int main(int argc, char** argv) {
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
         int32_t lend_first_now = -1;      // where its buffers are laid out now
+        // DUAL-GPU: the same per side - each prefill borrows the tail of ITS OWN cache.  The CHUNK is common
+        // (the two sides interleave per chunk through side 0's on_chunk), so each side plans its lend and the
+        // smaller of the two chunks wins for both.
+        int32_t lend_first1 = -1, lend_first1_now = -1;
+        void* borrow1 = nullptr;
+        uint64_t borrow1_bytes = 0;
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card the
         // cache already filled to its reserve, that is the over-subscription the auto sizing avoids - so the
         // prompt chunk is halved until its buffers fit in the lendable slots (a smaller chunk only reads slower)
-        // (a split does not lend yet: each side's cache is its own, and the per-side lending is a later
-        // refinement - the non-borrow path's chunk reserve keeps the buffers inside the card)
-        if (n_sides == 1 && !o.no_prefill_borrow && d_res != nullptr) {
-            int64_t chunk = o.prefill_chunk;
-            if (const int64_t k = plan_lend(chunk); k > 0) {
+        if (!o.no_prefill_borrow && d_res != nullptr) {
+            int64_t chunk = o.prefill_chunk, k0 = 0;
+            if (n_sides == 2) {
+                int64_t chunk1 = o.prefill_chunk;
+                k0 = plan_lend(chunk, 0);
+                const int64_t k1 = plan_lend(chunk1, 1);
+                if (k0 <= 0 || k1 <= 0) { k0 = 0; }
+                else if (chunk1 < chunk) chunk = chunk1;   // the tighter card sets the shared chunk
+            } else {
+                k0 = plan_lend(chunk, 0);
+            }
+            if (k0 > 0) {
                 if (o.prefill_auto)
                     std::fprintf(stderr, "strata serve: prompt chunk auto: %lld tokens\n", (long long) chunk);
                 else if (chunk != o.prefill_chunk)
                     std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens so its buffers fit in the "
                                          "expert cache\n", (long long) o.prefill_chunk, (long long) chunk);
                 o.prefill_chunk = chunk;
-                lend_first = (int32_t) (xcache.slots() - k);
+                lend_first = (int32_t) (sides[0].xcache.slots() - k0);
                 lend_first_now = lend_first;
-                borrow = xcache.device_slot(lend_first);
-                borrow_bytes = xcache.slot_offsets()
-                                   ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[lend_first])
-                                   : (uint64_t) k * (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+                borrow = sides[0].xcache.device_slot(lend_first);
+                borrow_bytes = lend_bytes(lend_first, 0);
+                if (n_sides == 2) {
+                    // side 1 re-plans with the SHARED chunk (its own plan may have allowed more)
+                    int64_t c1 = chunk;
+                    const int64_t k1 = plan_lend(c1, 1);
+                    if (k1 > 0) {
+                        lend_first1 = (int32_t) (sides[1].xcache.slots() - k1);
+                        borrow1 = sides[1].xcache.device_slot(lend_first1);
+                        borrow1_bytes = lend_bytes(lend_first1, 1);
+                        std::fprintf(stderr, "strata serve: side 1's prompt path borrows %lld cache slots (%.2f GiB)\n",
+                                     (long long) k1, (double) borrow1_bytes / 1073741824.0);
+                    }
+                }
             } else if (o.prefill_auto) {
                 o.prefill_chunk = 1024;   // nothing lendable: small buffers of its own
             }
@@ -2694,8 +2722,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
         for (int s = 0; s < n_sides; ++s) {
             DeviceGuard pf_guard(sides[s].ordinal);
-            const void* s_borrow = (s == 0) ? borrow : nullptr;
-            const uint64_t s_borrow_bytes = (s == 0) ? borrow_bytes : 0;
+            const void* s_borrow = (s == 0) ? borrow : borrow1;
+            const uint64_t s_borrow_bytes = (s == 0) ? borrow_bytes : borrow1_bytes;
             if (!sps[s]->init(sides[s].wt, g, sides[s].ss, srcp, &sides[s].xcache,
                               host_res.data(), o.prefill_chunk, sides[s].stream, err,
                               (void*) s_borrow, s_borrow_bytes)) {
@@ -3403,20 +3431,35 @@ int main(int argc, char** argv) {
             };
             // the batched path's slots are lent just before its first run and given back (refilled) before a window
             // reads - so the windows always see the whole expert cache - or once the prompt is read
-            std::vector<std::pair<int32_t, int32_t>> lent_now;
-            int64_t lent_chunk = 0;   // the chunk the lent slots hold the prompt path's buffers for
+            // DUAL-GPU: the lent bookkeeping is PER SIDE (each side's cache lends its own tail; the
+            // residency index i is global, the slot belongs to i's owning side)
+            std::vector<std::pair<int32_t, int32_t>> lent_now[2];
+            lend_first1_now = -1;   // the request starts with nothing lent
+            int64_t lent_chunk = 0;   // the (common) chunk the lent slots hold the prompt path's buffers for
             auto refill = [&](std::string& e) -> bool {
-                if (lent_now.empty()) return true;
-                tr("refill start", (long long) lent_now.size());
-                for (const auto& [i, slot] : lent_now) {
-                    const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
-                    if (b == nullptr || !xcache.fill_slot_blocking(slot, b, e,
-                            (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert)))
-                        return false;
-                    host_res[(size_t) i] = slot;
+                if (lent_now[0].empty() && (n_sides == 1 || lent_now[1].empty())) return true;
+                tr("refill start", (long long) (lent_now[0].size() + (n_sides == 2 ? lent_now[1].size() : 0)));
+                for (int s = 0; s < n_sides; ++s) {
+                    if (lent_now[s].empty()) continue;
+                    DeviceGuard rf(sides[s].ordinal);
+                    for (const auto& [i, slot] : lent_now[s]) {
+                        const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
+                        if (b == nullptr || !sides[s].xcache.fill_slot_blocking(slot, b, e,
+                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert)))
+                            return false;
+                        host_res[(size_t) i] = slot;
+                    }
+                    lent_now[s].clear();
                 }
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
-                lent_now.clear();
+                {
+                    DeviceGuard rf0(sides[0].ordinal);
+                    cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                }
+                for (int s = 1; s < n_sides; ++s) {
+                    DeviceGuard rfs(sides[s].ordinal);
+                    cudaMemcpy(sides[s].d_res, host_res.data(), host_res.size() * sizeof(int32_t),
+                               cudaMemcpyHostToDevice);
+                }
                 lent_chunk = 0;
                 return true;
             };
@@ -3425,21 +3468,41 @@ int main(int argc, char** argv) {
             auto lend = [&](int64_t tokens, std::string& e) -> bool {
                 if (lend_first < 0) return true;                       // its own buffers: nothing to lend
                 const int64_t want = std::min<int64_t>(o.prefill_chunk, (tokens + 255) / 256 * 256);
-                if (!lent_now.empty()) {
+                if (!lent_now[0].empty() || (n_sides == 2 && !lent_now[1].empty())) {
                     if (want <= lent_chunk) return true;
                     if (!refill(e)) return false;
                 }
-                const int32_t first = std::max<int32_t>(lend_first, (int32_t) (xcache.slots() - lend_slots(want)));
-                if (want != sp.chunk() || first != lend_first_now) {
-                    if (!sp.relayout(want, xcache.device_slot(first), lend_bytes(first), e)) return false;
-                    lend_first_now = first;
-                }
-                for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= first) {
-                        lent_now.emplace_back((int32_t) i, host_res[i]);
-                        host_res[i] = strata::core::kNotResident;
+                for (int s = 0; s < n_sides; ++s) {
+                    const int32_t base_first = s == 0 ? lend_first : (n_sides == 2 ? lend_first1 : -1);
+                    if (base_first < 0) continue;                      // this side's own buffers
+                    const int32_t first = std::max<int32_t>(base_first,
+                        (int32_t) (sides[s].xcache.slots() - lend_slots(want, s)));
+                    if (want != sps[s]->chunk() || first != (s == 0 ? lend_first_now : lend_first1_now)) {
+                        DeviceGuard lg(sides[s].ordinal);
+                        if (!sps[s]->relayout(want, sides[s].xcache.device_slot(first), lend_bytes(first, s), e))
+                            return false;
+                        if (s == 0) lend_first_now = first; else lend_first1_now = first;
                     }
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                    // mask the OWNING side's slots from `first`: host_res[i]'s slot lives in i's layer's cache
+                    const int64_t lo = sides[s].layer_begin, hi = sides[s].layer_end;
+                    for (int64_t l = lo; l < hi; ++l)
+                        for (int64_t ei = 0; ei < g.n_expert; ++ei) {
+                            const size_t i = (size_t) (l * g.n_expert + ei);
+                            if (host_res[i] >= first) {
+                                lent_now[s].emplace_back((int32_t) i, host_res[i]);
+                                host_res[i] = strata::core::kNotResident;
+                            }
+                        }
+                }
+                {
+                    DeviceGuard lg0(sides[0].ordinal);
+                    cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                }
+                for (int s = 1; s < n_sides; ++s) {
+                    DeviceGuard lgs(sides[s].ordinal);
+                    cudaMemcpy(sides[s].d_res, host_res.data(), host_res.size() * sizeof(int32_t),
+                               cudaMemcpyHostToDevice);
+                }
                 lent_chunk = want;
                 return true;
             };
@@ -3788,10 +3851,10 @@ int main(int argc, char** argv) {
         uint64_t borrow_bytes = 0;
         if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
             int64_t chunk = o.prefill_chunk;
-            int64_t k = plan_lend(chunk);             // auto: the largest chunk that fits; fixed: halved to fit
+            int64_t k = plan_lend(chunk, 0);         // auto: the largest chunk that fits; fixed: halved to fit
             if (k > 0 && chunk > (n_prompt - 1 + 255) / 256 * 256) {   // no bigger than the prompt needs
                 chunk = std::max<int64_t>(256, (n_prompt - 1 + 255) / 256 * 256);
-                k = lend_slots(chunk);
+                k = lend_slots(chunk, 0);
                 if (!o.prefill_auto) o.prefill_chunk = chunk;
             }
             if (o.prefill_auto) {
