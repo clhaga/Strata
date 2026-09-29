@@ -673,7 +673,19 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     // A streamed state starts over with nothing resident. Its host copy is not cleared (GBs over PCIe per new
     // conversation): no reader names a cell before this sequence has written it, and a block copied in whole
     // carries the unwritten cells past the end, which nothing reads.
-    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, stream);
+    if (st.kv_mode == 1) {
+        strata::kernels::kv_stream_reset(st.map, stream);
+        // DUAL-GPU DIAGNOSTIC: the reset kernel faulted on a split box with, on paper, all-device-local
+        // pointers - so print them (with the sizes the kernel indexes) and SYNC per state, making the
+        // fault synchronous and attached to the exact state instead of surfacing downstream.
+        std::fprintf(stderr, "strata diag: kv reset: table %p blocks %lld slots %lld, slot_block %p ctl %p "
+                             "page_table %p\n", (void*) st.map.slot_block, (long long) st.map.n_blocks,
+                     (long long) st.map.n_slots, (void*) st.map.ctl, (void*) st.map.page_table);
+        cudaStreamSynchronize((cudaStream_t) stream);
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess)
+            std::fprintf(stderr, "strata diag: kv reset FAILED: %s\n", cudaGetErrorString(e));
+    }
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
