@@ -2748,6 +2748,15 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: side %d's prompt path: %s\n", s, err.c_str());
                 return 1;
             }
+            // SYNC AND CHECK HERE, because the init's tail (the relayout into the borrowed cache slots,
+            // mmq::iota) launches kernels whose async faults would otherwise surface LATER - at the first
+            // checked launch of the first request, wearing that kernel's name.  An error here names the
+            // prompt path instead of framing kv_stream's reset.
+            if (cudaStreamSynchronize(sides[s].stream) != cudaSuccess) {
+                std::fprintf(stderr, "strata serve: side %d's prompt path failed asynchronously: %s\n", s,
+                             cudaGetErrorString(cudaGetLastError()));
+                return 1;
+            }
         }
         mem_mark("the head and the prompt path");
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
