@@ -1332,20 +1332,21 @@ int main(int argc, char** argv) {
                      (long long) sides[s].layer_begin, (long long) sides[s].layer_end,
                      n_sides == 2 ? " - one side of the split" : "",
                      skip_side.size(), n_sides == 2 ? "foreign layers or served natively" : "served natively");
-        if (!o.native_dense_gguf.empty() &&
-            !sides[s].native_dense.load(o.native_dense_gguf, sides[s].wt, err, o.native_ple_key)) {
-            std::fprintf(stderr, "strata generate: native dense projections (side %d): %s\n", s, err.c_str());
-            return 1;
+        if (!o.native_dense_gguf.empty()) {
+            if (!sides[s].native_dense.load(o.native_dense_gguf, sides[s].wt, err, o.native_ple_key,
+                                            sides[s].layer_begin, sides[s].layer_end)) {
+                std::fprintf(stderr, "strata generate: native dense projections (side %d): %s\n", s, err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: side %d: %zu native projection matrices, %.2f MiB of weights\n",
+                         s, sides[s].native_dense.tensor_count(),
+                         (double) sides[s].native_dense.weight_bytes() / (1024.0 * 1024.0));
         }
     }
     // the historic names: side 0 IS the whole model when there is no split
     strata::core::WeightTable& wt = sides[0].wt;
     void* arena = sides[0].dense_arena;
     strata::core::NativeDense& native_dense = sides[0].native_dense;
-    if (!o.native_dense_gguf.empty() && n_sides == 1) {
-        std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights\n",
-                     native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0));
-    }
 
     strata::kernels::gr_set_fp32_activations(o.gr_fp32_activations);
     strata::kernels::gr_set_native_mmvf(o.gr_native_mmvf);
@@ -1628,7 +1629,15 @@ int main(int argc, char** argv) {
         static const strata::core::ModelGeometry draft_geometry{};
         // the drafter runs after layer 47, so it lives on the LAST side's device and session
         DeviceGuard mtp_guard((int) (n_sides - 1));
-        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, sides[n_sides - 1].ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, sides[n_sides - 1].ss, o.spec, err, o.mtp_window)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+#if defined(_WIN32)
+            std::fprintf(stderr, "strata generate: on Windows a graphics card's memory also needs room in the page "
+                                 "file: set it to \"System managed\" (System > About > Advanced system settings > "
+                                 "Performance > Advanced > Virtual memory), then start again\n");
+#endif
+            return 1;
+        }
     }
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);

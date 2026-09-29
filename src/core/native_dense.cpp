@@ -3,6 +3,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
+#include <cstdio>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <climits>
@@ -58,7 +59,7 @@ NativeDense::~NativeDense() {
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-                       bool include_ple_key) {
+                       bool include_ple_key, int64_t layer_begin, int64_t layer_end) {
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
@@ -128,6 +129,16 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             }
             for (const auto& tensor : gguf.tensors()) {
                 if (!eligible(tensor, include_ple_key)) continue;
+                // DUAL-GPU: only THIS side's layers.  Every cudaMalloc here lands on the calling side's
+                // device AND on Windows is charged to the system commit, so a side uploading the whole
+                // model's native projections (~2.7 GB it never reads) can starve a later allocation on a
+                // card whose VRAM is free (issue #60's mechanism, one level up).
+                {
+                    int l = -1;
+                    if (std::sscanf(tensor.name.c_str(), "blk.%d.", &l) == 1 &&
+                        (l < (int) layer_begin || l >= (int) layer_end))
+                        continue;
+                }
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name; return false;
                 }
