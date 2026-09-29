@@ -68,9 +68,30 @@ which cuts the exposed CPU expert term (`expert_cache.hpp:3`, the largest single
 7. **`expert_source.hpp` / `ExpertDispatch`**: a second pointer set (parts/hit/cache) selected by its
    own layer counter when `split_at` is set, or one `ExpertDispatch` per side with the pool callback
    dispatching on the layer it is serving.
-8. **`generate.cpp` decode drivers + checkpoints**: the `ConvCheckpoint` save/restore per side (gather/
-   scatter), the `--serve` request loop driving the split verify+prefill, `host_res`/`d_res` per side,
-   the adapt/swaps refill per side. Then delete the refusal.
+8. **`generate.cpp` decode drivers + checkpoints** - THE LAST C++ PIECE. Call-site map (line numbers
+   on `dual-gpu` at 9bfd8e0):
+   - `2413-2444` the `host_res`/`d_res`/`thits` build -> per side (`sides[s].host_res/d_res`, one
+     `VerifyHits` per side); the adapt/swaps blocks that follow (`2699-2739`, `3178-3180`, `3608-3610`)
+     update host_res rows and re-upload d_res - PER SIDE (a swap admits into the OWNING side's cache).
+   - `2589` `sp.init(wt, g, ss, srcp, &xcache, host_res, ...)` -> per side (each under a DeviceGuard,
+     its stream, its cache, its host_res); `3196`/`3575` the second `sp.init` (non-serve path) too.
+   - `2611-2617` `ver.init(wt, g, ss, vh, head, spec)` + `ver.set_*` -> per side; `mtp.bind(wt, ...)`
+     takes SIDES[1]'s table and `ver1.final_R_all()`.
+   - `2665` `sp.on_chunk` (mtp.prefill + PP + checkpoints) -> SIDE 1's instance; side 0's becomes the
+     handoff: D2H `m.R` (one pinned buffer, T*hc*n_embd) -> `sp1.set_external_r(buf, T)` ->
+     `sp1.run(tokens+c0, T, p0, e)`.
+   - `3152`/`3353` `ver.run(T, win, q, &drive_pool_multi, &drive, out, e)` -> a `run_window` helper:
+     `ver0.run(..., &drive0)`, `ver1.adopt_state(ver0, T)`, `ver1.run(..., &drive1)` (out from ver1);
+     `3156`/`3364` `ver.commit` -> BOTH sides; `3223-3226` sampling/history on ver1 only.
+   - `3262` `sp.run(ids+at, to-at, at, e)` (the resume-from-checkpoint prompt read) and the non-serve
+     prompt read -> the split interleave (a `split_prompt` helper mirroring the on_chunk handoff).
+   - `3581` (non-serve) `mtp.bind` -> side-1 table; `3589` the non-serve `sp.on_chunk` -> side 1.
+   - `ConvCheckpoint` (`checkpoint_save`/`_restore`, ~:654): per side - gather from both `sides[s].ss`,
+     restore to both; the PLE fields are side 0's only.
+   - THEN delete the refusal (~:1891) and make `graph_hits`/lending gates side-aware.
+   TWO `Drive`/`ExpertDispatch` instances (drive0/drive1), each wired to its side's cache/host_res/
+   `vers[s].plan_sink()`; the CPU ExpertPool is shared (the windows are serial, so its workers never
+   serve both sides at once).
 9. **`serve/server.py` + `setup.py`**: `"gpus": [a, b]` config; `child_env` sets `CUDA_VISIBLE_DEVICES=a,b`;
    setup writes both; telemetry watches both NVML indices; START-HERE passes `--split-layers 24`.
 10. **`tools/bench_dual.py`**: greedy, fixed seed, `--split-layers 0` vs `24`, asserts identical token
