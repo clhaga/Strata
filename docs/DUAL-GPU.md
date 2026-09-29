@@ -1,9 +1,12 @@
 # DUAL-GPU: a layer split across two cards
 
-**Status: PHASE 1 LANDED AND COMPILES CLEAN** (CUDA 12.0, sm_86, GCC 13, all targets including the test
-binaries; one fix the compiler caught: `session_run_token`'s definition needed the new `done` parameter).
-The decode-path split is NOT yet wired - `--split-layers` loads both cards and then refuses rather than
-decode on a half-split engine. Written for two RTX 3060
+**Status: FEATURE-COMPLETE FOR `--serve` AND COMPILES CLEAN (CUDA 12.0 / sm_86); NOT YET RUN ON
+HARDWARE.** `--split-layers N` with `--serve` runs the whole engine on two cards: both sides' weights,
+sessions and profile-filled expert caches, the verify windows through both verifiers with the boundary
+handoff, the prompt path interleaved per chunk, MTP on side 1, per-side conversation checkpoints, and
+the server/setup plumbing (`--gpus 0,1`). Scope notes: the split requires `--serve` (the single-shot
+loop is refused rather than run half-split), cache borrowing/lending and the adaptive tier stay
+single-side, and telemetry watches the first card. Written for two RTX 3060
 12 GB; the point is not parallelism — the 48-layer residual chain is strictly serial (`session.hpp:117`) —
 but **capacity**: dense weights do not duplicate, so two cards hold roughly 3x the expert cache of one,
 which cuts the exposed CPU expert term (`expert_cache.hpp:3`, the largest single cost in a token).
@@ -179,8 +182,14 @@ P6 server/setup/docs/bench (7-8).
 
 ## Verification (on the 2x3060 box)
 
-1. Build: `python3 setup.py` (or the existing flow) — must compile clean on sm_86.
-2. Regression: today's exact command, no flag — tok/s and tokens within noise of the installed engine.
-3. Correctness: `tools/bench_dual.py` — greedy, fixed seed, split vs no-split token streams identical.
-4. Speed: 128K-context conversation, IQ3_XXS: expect ~38-45 tok/s (from 31) and a shorter TTFT; per-card
+0. On the 3060 box: `git fetch && git checkout dual-gpu` (github.com/clhaga/Strata), rebuild via the
+   normal setup flow — this branch has compiled on CUDA 12.0/sm_86 but never met a GPU.
+1. Regression: today's exact command, no flag — tok/s and tokens within noise of the installed engine.
+2. Correctness: `python3 tools/bench_dual.py --split 24 --cmd <engine> --serve <your usual flags>`
+   (the split currently requires --serve) — greedy, split vs no-split token streams must match.
+3. Speed: 128K-context conversation, IQ3_XXS: expect ~38-45 tok/s (from 31) and a shorter TTFT; per-card
    VRAM via nvidia-smi should show both cards near-full expert caches.
+4. Through the server: re-run setup with `--gpus 0,1` (writes the config + the flag), or start the
+   server with `--gpus 0,1 --split-layers 24`.
+Known-unsplit (safe fallbacks, all gated off or refused): single-shot generate, cache lending, the
+adaptive tier, vision-encoder GPU choice, per-card telemetry.

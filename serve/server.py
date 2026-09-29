@@ -460,7 +460,10 @@ def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
     env = dict(os.environ)
-    if cfg.get("gpu") is not None:                   # issue #51: the GPU to run on, numbered as nvidia-smi does; CUDA's
+    if cfg.get("gpus"):                              # dual-GPU (docs/DUAL-GPU.md): BOTH cards visible, in nvidia-smi's
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # order - the engine splits its layers at --split-layers
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in cfg["gpus"])
+    elif cfg.get("gpu") is not None:                 # issue #51: the GPU to run on, numbered as nvidia-smi does; CUDA's
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = str(cfg["gpu"])
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
@@ -1464,6 +1467,11 @@ def main() -> int:
                          "them in turn and the last one repeats")
     ap.add_argument("--port", type=int, default=8095)
     ap.add_argument("--gpu", type=int, help="the GPU to run on, as nvidia-smi numbers them (also \"gpu\" in the config)")
+    ap.add_argument("--gpus", type=lambda s: [int(x) for x in s.split(",")],
+                    help="dual-GPU: two card indices as nvidia-smi numbers them, e.g. 0,1 - the engine splits its "
+                         "layers across them at --split-layers (docs/DUAL-GPU.md; also \"gpus\" in the config)")
+    ap.add_argument("--split-layers", type=int, default=24,
+                    help="with --gpus: layers [0,N) on the first card, [N,48) on the second (default 24)")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
                     help="pack tokenizer directory (falls back to a byte tokenizer if absent)")
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
@@ -1479,6 +1487,14 @@ def main() -> int:
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
     if a.gpu is not None:
         cfg["gpu"] = a.gpu
+    if a.gpus:
+        if len(a.gpus) != 2 or len(set(a.gpus)) != 2:
+            ap.error("--gpus takes exactly two distinct card indices, e.g. 0,1")
+        cfg["gpus"] = a.gpus          # both cards visible to the engine; the single-card mask would hide one
+        cfg.pop("gpu", None)
+        cfg.setdefault("args", [])
+        if "--split-layers" not in cfg["args"]:
+            cfg["args"] = list(cfg["args"]) + ["--split-layers", str(a.split_layers)]
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()

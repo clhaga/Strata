@@ -1085,6 +1085,11 @@ def main() -> int:
     ap.add_argument("--port", type=int, help="the server's port (default: the one the install was set up with, 8080 for a new one)")
     ap.add_argument("--gpu", type=int, help="the GPU to use, numbered as nvidia-smi numbers them (default: the one with the "
                                             "most VRAM; with --setup it is saved, when starting it overrides the saved one)")
+    ap.add_argument("--gpus", type=lambda s: [int(x) for x in s.split(",")], default=None,
+                    help="dual-GPU: two card indices as nvidia-smi numbers them, e.g. 0,1 - both cards run the engine, "
+                         "its layers split at --split-layers (docs/DUAL-GPU.md)")
+    ap.add_argument("--split-layers", type=int, default=24,
+                    help="with --gpus: layers [0,N) on the first card, [N,48) on the second (default 24)")
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = also other "
                                    "devices on your network (issue #26; set --api-key too)")
     ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0)")
@@ -1413,7 +1418,14 @@ def main() -> int:
     cfg = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "log": str(ROOT / f"strata-{tag.lower()}.log"),
            "lib_dirs": lib_dirs, "port": port}
-    if gpu["count"] > 1 or a.gpu is not None:
+    if a.gpus:
+        if len(a.gpus) != 2 or len(set(a.gpus)) != 2:
+            sys.exit("--gpus takes exactly two distinct card indices, e.g. 0,1")
+        cfg["gpus"] = a.gpus                           # dual-GPU: both cards, layers split (docs/DUAL-GPU.md)
+        cfg["args"] = list(cfg["args"]) + ["--split-layers", str(a.split_layers)]
+        ok(f"dual-GPU: cards {a.gpus[0]},{a.gpus[1]}, layers [0,{a.split_layers}) on the first "
+           f"(~3x the expert cache of one card; docs/DUAL-GPU.md)")
+    elif gpu["count"] > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]                      # the engine is told this card (issue #51)
     if a.host:
         cfg["host"] = a.host
