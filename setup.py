@@ -481,6 +481,12 @@ def get_prebuilt(url_base, gpu, vision, updating=False) -> Path | None:
         meta = json.loads(info.read_text())
         ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
         if meta.get("source") == "local" or ver >= MIN_ENGINE:
+            if not updating and meta.get("source") == "local" and meta.get("src") != source_hash(ENGINE_SOURCES):
+                # a locally compiled engine whose source has changed since (a git pull): build it again.
+                # Until now this early return accepted ANY local build, so the fingerprint check in
+                # build_engine - and with it every recompile after a pull - was unreachable without --build.
+                say("  The installed engine was compiled from different source (a git pull?): building it again ...")
+                return None
             ok("ready-made engine already installed")
             return eng
         say(f"  Updating the ready-made engine ({meta.get('version')} -> {'.'.join(map(str, MIN_ENGINE))} or newer) ...")
