@@ -178,9 +178,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
                 if (GlobalMemoryStatusEx(&ms))
                     std::fprintf(stderr, "strata mtp diag: Windows commit: %.1f of %.1f GiB used (limit = RAM + page "
                                          "file; %.1f GiB available), RAM %.1f of %.1f GiB in use\n",
-                                 (double) (ms.totalPageFile - ms.availPageFile) / 1073741824.0,
-                                 (double) ms.totalPageFile / 1073741824.0,
-                                 (double) ms.availPageFile / 1073741824.0,
+                                 (double) (ms.ullTotalPageFile - ms.ullAvailPageFile) / 1073741824.0,
+                                 (double) ms.ullTotalPageFile / 1073741824.0,
+                                 (double) ms.ullAvailPageFile / 1073741824.0,
                                  (double) (ms.ullTotalPhys - ms.ullAvailPhys) / 1073741824.0,
                                  (double) ms.ullTotalPhys / 1073741824.0);
 #endif
