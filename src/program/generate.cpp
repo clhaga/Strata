@@ -214,6 +214,10 @@ struct Options {
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
+    /// DUAL-GPU (`docs/DUAL-GPU.md`): run layers [0, N) on visible device 0 and [N, 48) on visible device 1.
+    /// 0 (the default) is the historic single-device engine.  The win is capacity - dense weights do not
+    /// duplicate, so both cards hold expert caches - not parallelism; the residual chain stays serial.
+    int split_layers = 0;
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
@@ -309,6 +313,7 @@ void usage() {
                  "                       VRAM; default fp16 until gate G-C accepts int8\n"
                  "  --kv q4_0            4-bit K/V after a Hadamard rotation (PR #21): half of int8's memory,\n"
                  "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
+                 "  --split-layers N     dual-GPU: layers [0,N) on device 0, [N,48) on device 1 (docs/DUAL-GPU.md)\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
@@ -898,6 +903,7 @@ int main(int argc, char** argv) {
             o.expert_cache = (v == "auto") ? -1 : std::atoi(v.c_str());
         }
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
+        else if (a == "--split-layers") o.split_layers = std::atoi(next("--split-layers"));
         else if (a == "--prefill") {
             const std::string v = next("--prefill");
             o.prefill_auto = v == "auto";
@@ -1166,6 +1172,75 @@ int main(int argc, char** argv) {
                      o.pack.c_str(), (double) strata::kernels::cpu::expert_layout().max_blob / 1e6,
                      native_embed.type(), (double) native_embed.bytes() / 1048576.0);
     }
+    // ================================ DUAL-GPU: THE SIDES (`docs/DUAL-GPU.md`) ================================
+    //
+    // `--split-layers N` gives side 0 layers [0, N) and side 1 layers [N, 48), each its own device, stream,
+    // dense-weight table + arena, session state and expert cache.  With no flag there is ONE side covering the
+    // whole model, and every allocation below runs exactly as it did before this scaffold existed - same
+    // order, same sizes, device 0.  The historic local names (`wt`, `arena`, `ss`, `sbuf`, `main_cs`) stay as
+    // references to side 0 so the unsplit code paths are the same lines they always were.
+    struct GpuSide {
+        int ordinal = 0;
+        int64_t layer_begin = 0, layer_end = 0;
+        cudaStream_t stream = nullptr;
+        void* dense_arena = nullptr;
+        uint64_t dense_bytes = 0;
+        strata::core::WeightTable wt;
+        strata::core::NativeDense native_dense;
+        void* session_arena = nullptr;
+        strata::core::SessionState ss;
+        float* parts_dev = nullptr;             ///< THIS side's post graphs read their experts from here
+        strata::core::ExpertCache xcache;       ///< this card's VRAM expert tier, owned layers only
+        int expert_cache = 0;                   ///< the slot count this side settled on (0 = none)
+        std::vector<int64_t> sized_slots;       ///< a native pack's per-blob slot sizes, this side
+        int64_t prefilled = 0;                  ///< profile pairs this side filled
+    };
+    const int n_sides = o.split_layers > 0 ? 2 : 1;
+    const int64_t n_layers_total = strata::core::ModelGeometry{}.n_layers;
+    GpuSide sides[2];
+    for (int s = 0; s < n_sides; ++s) {
+        sides[s].ordinal = s;
+        sides[s].layer_begin = (s == 0) ? 0 : o.split_layers;
+        sides[s].layer_end = (s == 0) ? (n_sides == 1 ? n_layers_total : o.split_layers) : n_layers_total;
+    }
+    /// RAII: everything a side owns is allocated and freed with ITS device current, because a bare cudaMalloc
+    /// lands on whatever is current and the engine's default has always been 0.
+    struct DeviceGuard {
+        int prev_ = 0;
+        bool moved_ = false;
+        explicit DeviceGuard(int ordinal) {
+            if (cudaGetDevice(&prev_) != cudaSuccess) return;
+            int cur = prev_;
+            if (cudaSetDevice(ordinal) == cudaSuccess) { cudaGetDevice(&cur); moved_ = cur != prev_; }
+        }
+        ~DeviceGuard() { if (moved_) cudaSetDevice(prev_); }
+    };
+    if (n_sides == 2) {
+        int visible = 0;
+        if (cudaGetDeviceCount(&visible) != cudaSuccess || visible < 2) {
+            std::fprintf(stderr, "strata generate: --split-layers needs two CUDA devices visible to this "
+                                 "process (%d visible); check CUDA_VISIBLE_DEVICES\n", visible);
+            return 2;
+        }
+        std::fprintf(stderr, "strata generate: dual-GPU: layers [0, %d) on device 0, [%d, %lld) on device 1\n",
+                     o.split_layers, o.split_layers, (long long) n_layers_total);
+    }
+    /// `blk.<l>.` for every l outside [begin, end) - the tensors the OTHER side loads, so this side's arena
+    /// holds only its own layers and the loader's compaction does the placement.
+    auto foreign_layer_names = [&](int64_t begin, int64_t end) -> std::set<std::string> {
+        std::set<std::string> out;
+        std::vector<std::string> names;
+        if (!strata::core::index_names(o.pack, names, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            exit(2);
+        }
+        for (const std::string& n : names) {
+            int l = -1;
+            if (std::sscanf(n.c_str(), "blk.%d.", &l) == 1 && (l < begin || l >= end)) out.insert(n);
+        }
+        return out;
+    };
+
     // Plan v0.3 P1: tensors served in native form are not also loaded in canonical form (~2.7 GB of VRAM back
     // to the expert cache with --native).  `--keep-canonical` loads both, as before.
     std::set<std::string> skip;
@@ -1180,32 +1255,49 @@ int main(int argc, char** argv) {
         if (!native_pack) skip.erase("blk.1.ple_key.weight");
         if (native_pack) skip.insert("token_embd.weight");
     }
-    uint64_t pool_bytes = 0;
-    if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
-        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-        return 1;
-    }
-    void* arena = nullptr;
-    if (cudaMalloc(&arena, pool_bytes) != cudaSuccess) {
-        std::fprintf(stderr, "strata generate: cudaMalloc(%llu) for the weight arena failed\n",
-                     (unsigned long long) pool_bytes);
-        return 1;
-    }
-    strata::core::WeightTable wt;
-    if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
-        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-        return 1;
-    }
-    std::fprintf(stderr, "strata generate: %llu MiB of weights loaded from %s (%zu canonical tensors skipped: "
-                         "served natively)\n",
-                 (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), skip.size());
-
-    strata::core::NativeDense native_dense;
-    if (!o.native_dense_gguf.empty()) {
-        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
-            std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
+    for (int s = 0; s < n_sides; ++s) {
+        DeviceGuard dg(sides[s].ordinal);
+        std::set<std::string> skip_side = skip;
+        if (n_sides == 2) {
+            // this side's arena holds ONLY its layers' tensors; the globals go to their one consumer - the
+            // embedding to side 0 (layer 0 feeds it), the head to the last side (layer 47 reads it)
+            std::set<std::string> foreign = foreign_layer_names(sides[s].layer_begin, sides[s].layer_end);
+            skip_side.insert(foreign.begin(), foreign.end());
+            if (s == 0) skip_side.insert("output.weight");
+            if (s + 1 == n_sides) skip_side.insert("token_embd.weight");
+        }
+        if (!strata::core::WeightTable::pool_bytes(o.pack, sides[s].dense_bytes, err,
+                                                   skip_side.empty() ? nullptr : &skip_side)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        if (cudaMalloc(&sides[s].dense_arena, sides[s].dense_bytes) != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: cudaMalloc(%llu) for side %d's weight arena failed\n",
+                         (unsigned long long) sides[s].dense_bytes, s);
+            return 1;
+        }
+        if (!sides[s].wt.load(o.pack, sides[s].dense_arena, sides[s].dense_bytes, err,
+                              skip_side.empty() ? nullptr : &skip_side)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: %llu MiB of weights loaded from %s for layers [%lld, %lld)%s"
+                             " (%zu canonical tensors skipped: %s)\n",
+                     (unsigned long long) (sides[s].dense_bytes >> 20), o.pack.c_str(),
+                     (long long) sides[s].layer_begin, (long long) sides[s].layer_end,
+                     n_sides == 2 ? " - one side of the split" : "",
+                     skip_side.size(), n_sides == 2 ? "foreign layers or served natively" : "served natively");
+        if (!o.native_dense_gguf.empty() &&
+            !sides[s].native_dense.load(o.native_dense_gguf, sides[s].wt, err, o.native_ple_key)) {
+            std::fprintf(stderr, "strata generate: native dense projections (side %d): %s\n", s, err.c_str());
+            return 1;
+        }
+    }
+    // the historic names: side 0 IS the whole model when there is no split
+    strata::core::WeightTable& wt = sides[0].wt;
+    void* arena = sides[0].dense_arena;
+    strata::core::NativeDense& native_dense = sides[0].native_dense;
+    if (!o.native_dense_gguf.empty() && n_sides == 1) {
         std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights\n",
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0));
     }
@@ -1272,35 +1364,44 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (o.split_layers != 0 &&
+        (o.split_layers < 2 || o.split_layers > (int64_t) strata::core::ModelGeometry{}.n_layers - 1)) {
+        std::fprintf(stderr, "strata generate: --split-layers must be in [2, %lld] - at least layer 0..1 (the "
+                             "PLE is layer 1) on side 0, at least the last layer on side 1\n",
+                     (long long) (strata::core::ModelGeometry{}.n_layers - 1));
+        return 2;
+    }
     if (o.max_context < (int64_t) o.tokens.size() + o.max_new) {
         std::fprintf(stderr, "strata generate: --max-context %lld cannot hold %zu prompt + %lld new tokens\n",
                      (long long) o.max_context, o.tokens.size(), (long long) o.max_new);
         return 2;
     }
 
-    void* sbuf = nullptr;
-    if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K)) != cudaSuccess) {
-        std::fprintf(stderr, "strata generate: session state allocation failed\n");
-        return 1;
+    for (int s = 0; s < n_sides; ++s) {
+        DeviceGuard dg(sides[s].ordinal);
+        const uint64_t sb = strata::core::session_bytes_range(g, o.max_context, K, sides[s].layer_begin,
+                                                              sides[s].layer_end);
+        if (cudaMalloc(&sides[s].session_arena, sb) != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: session state allocation failed (side %d)\n", s);
+            return 1;
+        }
+        if (strata::core::session_init_range(g, o.max_context, K, sides[s].session_arena, sides[s].ss,
+                                             sides[s].layer_begin, sides[s].layer_end) == 0) {
+            std::fprintf(stderr, "strata generate: session_init failed (side %d)\n", s);
+            return 1;
+        }
+        if (cudaStreamCreateWithFlags(&sides[s].stream, cudaStreamNonBlocking) != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: cannot create side %d's stream\n", s);
+            return 1;
+        }
     }
-    strata::core::SessionState ss;
-    // **THE ENGINE RAN ON THE LEGACY DEFAULT STREAM, WHICH ON WDDM IS THE SLOW PATH.**  All four session
-    // calls - `session_capture`, `session_replay`, `session_token` and `session_loop` - were handed `nullptr`,
-    // i.e. stream 0.  `bench/micro/kernel_costs.cu` measures what that costs: EVERY kernel it launches through
-    // a wrapper comes back at 28-31 us REGARDLESS OF SIZE, `scale_inplace` on 2,048 floats and `silu_inplace`
-    // on 10,240 floats being indistinguishable, which is a fixed per-launch cost and not execution.
-    // `bench/micro/graph_node_cost.cu` measures the same kernels on a real stream at 3.63 us ungrapped and
-    // 0.805 us inside a graph.  **That is an ~8x penalty on every launch in the engine.**
-    cudaStream_t main_stream = nullptr;
-    if (cudaStreamCreateWithFlags(&main_stream, cudaStreamNonBlocking) != cudaSuccess) {
-        std::fprintf(stderr, "strata generate: cannot create the main stream\n");
-        return 1;
-    }
+    strata::core::SessionState& ss = sides[0].ss;
+    void* sbuf = sides[0].session_arena;
+    // **THE ENGINE RAN ON THE LEGACY DEFAULT STREAM, WHICH ON WDDM IS THE SLOW PATH** - the note that made
+    // per-side streams the rule: measured ~8x per-launch when a session call runs on stream 0
+    // (`bench/micro/kernel_costs.cu` against `bench/micro/graph_node_cost.cu`).  Each side owns one.
+    cudaStream_t main_stream = sides[0].stream;
     void* const main_cs = (void*) main_stream;
-    if (strata::core::session_init(g, o.max_context, K, sbuf, ss) == 0) {
-        std::fprintf(stderr, "strata generate: session_init failed\n");
-        return 1;
-    }
     if (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1)
         std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
                              "%.2f GiB of pinned RAM\n", (long long) (ss.qsa_states[0].n_slots * 4),
@@ -1417,12 +1518,15 @@ int main(int argc, char** argv) {
                      "  The tokens below are NOT this model's; this is only useful for A/B measurement.\n");
     }
 
-    float* d_parts = nullptr;
-    if (cudaMalloc(&d_parts, (size_t) K * g.n_embd * 4) != cudaSuccess ||
-        cudaMemset(d_parts, 0, (size_t) K * g.n_embd * 4) != cudaSuccess) {
-        std::fprintf(stderr, "strata generate: the parts buffer failed\n");
-        return 1;
+    for (int s = 0; s < n_sides; ++s) {
+        DeviceGuard dg(sides[s].ordinal);
+        if (cudaMalloc(&sides[s].parts_dev, (size_t) K * g.n_embd * 4) != cudaSuccess ||
+            cudaMemset(sides[s].parts_dev, 0, (size_t) K * g.n_embd * 4) != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: the parts buffer failed (side %d)\n", s);
+            return 1;
+        }
     }
+    float* d_parts = sides[0].parts_dev;
 
     // ---- the CPU expert pool
     //
@@ -1477,7 +1581,9 @@ int main(int argc, char** argv) {
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
         static const strata::core::ModelGeometry draft_geometry{};
-        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+        // the drafter runs after layer 47, so it lives on the LAST side's device and session
+        DeviceGuard mtp_guard((int) (n_sides - 1));
+        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, sides[n_sides - 1].ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     }
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
@@ -1485,7 +1591,6 @@ int main(int argc, char** argv) {
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
     mem_mark("the weights, the session and the drafter");
-    strata::core::ExpertCache xcache;
     std::vector<std::pair<int32_t, int32_t>> profile;
     if (!o.expert_profile.empty()) {
         int64_t pslots = 0;
@@ -1504,11 +1609,13 @@ int main(int argc, char** argv) {
     // after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after it and ate most of
     // the 700 MiB: 128K IQ3_S ended with 30 MiB free, the driver paged, and a request stalled for good at its first
     // verify window.  Loaded first, the cache is sized around it.
-    const strata::core::WeightRef* wo = wt.find("output.weight");
+    const strata::core::WeightRef* wo = sides[n_sides - 1].wt.find("output.weight");
     if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty()) {
+        // the head reads the LAST layer's residual, so it belongs to the last side's device
+        DeviceGuard head_guard((int) (n_sides - 1));
         if (!native_head.load(o.native_head_gguf, g.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -1518,12 +1625,27 @@ int main(int argc, char** argv) {
     }
     std::vector<float> logits((size_t) n_vocab);
     float* d_logits = nullptr;
-    if (cudaMalloc(&d_logits, (size_t) n_vocab * 4) != cudaSuccess) {
+    {
+        DeviceGuard logits_guard((int) (n_sides - 1));   // logits come off the last side's residual
+        if (cudaMalloc(&d_logits, (size_t) n_vocab * 4) != cudaSuccess) {
         std::fprintf(stderr, "strata generate: the logits buffer failed\n");
         return 1;
+        }
     }
     const bool auto_cache = o.expert_cache < 0;
-    if (o.expert_cache < 0) {
+    for (int side_i = 0; side_i < n_sides; ++side_i) {
+    DeviceGuard cache_guard(sides[side_i].ordinal);
+    strata::core::ExpertCache& xcache = sides[side_i].xcache;
+    int& expert_cache = sides[side_i].expert_cache;
+    std::vector<int64_t>& sized_slots = sides[side_i].sized_slots;
+    int64_t& prefilled = sides[side_i].prefilled;
+    expert_cache = o.expert_cache;
+    // the profile slice this side owns: same ranked order, only its layers - the whole point of the split is
+    // that BOTH cards hold the hottest experts of THEIR layers
+    std::vector<std::pair<int32_t, int32_t>> prof_side;
+    for (const auto& pr : profile)
+        if (pr.first >= sides[side_i].layer_begin && pr.first < sides[side_i].layer_end) prof_side.push_back(pr);
+    if (expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         // Plan v0.3 P5: the batched prompt path's chunk buffers are allocated later, so they are reserved here -
@@ -1533,19 +1655,18 @@ int main(int argc, char** argv) {
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-        if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
-        o.expert_cache = (int) std::max<int64_t>(slots, 0);
-        std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved -> %d slots\n",
-                     (double) free_b / 1073741824.0, o.vram_reserve_mib, o.expert_cache);
+        if (!prof_side.empty()) slots = std::min<int64_t>(slots, (int64_t) prof_side.size());
+        expert_cache = (int) std::max<int64_t>(slots, 0);
+        std::fprintf(stderr, "strata generate: expert cache auto (side %d): %.2f GiB free, %d MiB reserved -> %d slots\n",
+                     side_i, (double) free_b / 1073741824.0, o.vram_reserve_mib, expert_cache);
     }
     // plan v0.3 P6: a native pack's blobs differ per layer, so with a profile its slots are sized per pair: the
     // same VRAM holds ~30% more IQ3_XXS experts than slots of the largest blob would
-    std::vector<int64_t> sized_slots;
-    if (native_pack && o.expert_cache > 0 && !profile.empty()) {
+    if (native_pack && expert_cache > 0 && !prof_side.empty()) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         const auto& lay = strata::kernels::cpu::expert_layout();
-        const uint64_t budget = (uint64_t) o.expert_cache * lay.max_blob;   // what the uniform sizing granted
+        const uint64_t budget = (uint64_t) expert_cache * lay.max_blob;   // what the uniform sizing granted
         uint64_t used = 0;
         size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
@@ -1555,27 +1676,27 @@ int main(int argc, char** argv) {
             used += b;
             sized_slots.push_back((int64_t) lay.blob_bytes(pr.first));
         }
-        o.expert_cache = (int) sized_slots.size();
+        expert_cache = (int) sized_slots.size();
     }
-    if (o.expert_cache > 0) {
+    if (expert_cache > 0) {
         // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
         auto shrink_to = [&](int64_t keep_bytes) -> bool {
-            if (keep_bytes <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
+            if (keep_bytes <= 0) { expert_cache = 0; sized_slots.clear(); return false; }
             if (!sized_slots.empty()) {
                 int64_t used = 0;
                 size_t keep = 0;
                 while (keep < sized_slots.size() && used + (sized_slots[keep] + 255) / 256 * 256 <= keep_bytes)
                     used += (sized_slots[keep++] + 255) / 256 * 256;
                 sized_slots.resize(keep);
-                o.expert_cache = (int) keep;
+                expert_cache = (int) keep;
             } else {
-                o.expert_cache = (int) (keep_bytes / (int64_t) strata::kernels::cpu::expert_layout().max_blob);
+                expert_cache = (int) (keep_bytes / (int64_t) strata::kernels::cpu::expert_layout().max_blob);
             }
-            if (o.expert_cache <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
+            if (expert_cache <= 0) { expert_cache = 0; sized_slots.clear(); return false; }
             return true;
         };
         auto cache_bytes = [&]() -> int64_t {
-            if (sized_slots.empty()) return (int64_t) o.expert_cache * (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            if (sized_slots.empty()) return (int64_t) expert_cache * (int64_t) strata::kernels::cpu::expert_layout().max_blob;
             int64_t b = 0;
             for (const int64_t s : sized_slots) b += (s + 255) / 256 * 256;
             return b;
@@ -1595,7 +1716,7 @@ int main(int argc, char** argv) {
                 err = "ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL)";
             } else {
                 ok = sized_slots.empty()
-                    ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
+                    ? xcache.open(expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
                     : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, err);
             }
             if (!ok) {
@@ -1613,7 +1734,7 @@ int main(int argc, char** argv) {
                 if (auto_cache && failed < 8 && shrink_to(cache_bytes() / 4 * 3)) {
                     ++failed;
                     std::fprintf(stderr, "strata generate: %s%s; trying a smaller expert cache: %d slots\n", err.c_str(),
-                                 commit, o.expert_cache);
+                                 commit, expert_cache);
                     continue;
                 }
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -1640,13 +1761,13 @@ int main(int argc, char** argv) {
             xcache.close();
             if (!shrink_to(keep_bytes)) break;
         }
-        if (failed > 0 && o.expert_cache > 0)
-            std::fprintf(stderr, "strata generate: expert cache: %d slots (%.2f GiB) after %d smaller tries - a bigger "
+        if (failed > 0 && expert_cache > 0)
+            std::fprintf(stderr, "strata generate: expert cache (side %d): %d slots (%.2f GiB) after %d smaller tries - a bigger "
                                  "page file lets it use more of the free VRAM\n",
-                         o.expert_cache, (double) xcache.bytes() / 1073741824.0, failed);
+                         side_i, expert_cache, (double) xcache.bytes() / 1073741824.0, failed);
     }
-    if (o.expert_cache > 0) {
-        std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
+    if (expert_cache > 0) {
+        std::fprintf(stderr, "strata generate: expert cache (side %d) %lld slots, %.2f GiB of VRAM; policy is\n", side_i,
                      (long long) xcache.slots(), xcache.gib());
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
@@ -1665,7 +1786,7 @@ int main(int argc, char** argv) {
             xcache.layer_slot_range(0, lo, hi);
             std::fprintf(stderr, "                 R4.2g PER-LAYER: each layer owns %lld slots (%lld..%lld).\n",
                          (long long) (hi - lo), (long long) lo, (long long) (hi - 1));
-        } else if (profile.empty()) {
+        } else if (prof_side.empty()) {
             std::fprintf(stderr, "                 compulsory-miss (fills with whatever the run routes first).\n");
         } else {
             std::fprintf(stderr, "                 PROFILE, ranked by routing frequency, no eviction.\n");
@@ -1675,15 +1796,14 @@ int main(int argc, char** argv) {
     // ONCE: with `slots` pairs and `slots` slots the cache is full when this returns, so the decode-time
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
     // the policy rather than a hint.
-    int64_t prefilled = 0;
-    if (!profile.empty() && srcp != nullptr) {
-        const int64_t want = std::min<int64_t>((int64_t) profile.size(), xcache.slots());
+    if (!prof_side.empty() && srcp != nullptr) {
+        const int64_t want = std::min<int64_t>((int64_t) prof_side.size(), xcache.slots());
         for (int64_t i = 0; i < want; ++i) {
-            const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
+            const int32_t slot = xcache.admit(prof_side[(size_t) i].first, prof_side[(size_t) i].second);
             if (slot == strata::core::kNotResident) break;
-            const uint8_t* b = srcp->blob(profile[(size_t) i].first, profile[(size_t) i].second);
+            const uint8_t* b = srcp->blob(prof_side[(size_t) i].first, prof_side[(size_t) i].second);
             if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
+                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(prof_side[(size_t) i].first))) {
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
@@ -1693,16 +1813,24 @@ int main(int argc, char** argv) {
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
-        if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
-                                srcp->blob(profile[0].first, profile[0].second), err,
-                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
+        if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(prof_side[0].first, prof_side[0].second),
+                                srcp->blob(prof_side[0].first, prof_side[0].second), err,
+                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(prof_side[0].first))) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
         mem_mark("the profile fill");
-        std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
-                     (long long) prefilled, (long long) want);
+        std::fprintf(stderr, "strata generate: side %d pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
+                     side_i, (long long) prefilled, (long long) want);
     }
+    }  // per-side expert cache
+
+    // the historic names again: the code below this point predates the split and talks to side 0
+    strata::core::ExpertCache& xcache = sides[0].xcache;
+    auto any_cache = [&]() -> bool {
+        for (int s = 0; s < n_sides; ++s) if (sides[s].expert_cache > 0) return true;
+        return false;
+    };
 
     Drive drive;
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
@@ -1720,7 +1848,7 @@ int main(int argc, char** argv) {
     uint8_t* d_hit_q8 = nullptr;
     float* d_hit_q8_scale = nullptr;   ///< R4.2h: the fp32 activation scales the CPU path also uses
     float* d_hit_out = nullptr;
-    if (o.expert_cache > 0 && !o.no_pool) {
+    if (any_cache() && !o.no_pool) {
         const uint64_t sb = strata::kernels::moe_hit_grouped_scratch_bytes(K, g.n_embd, strata::kernels::cpu::FF);
         if (cudaMalloc(&hit_scratch, (size_t) sb) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_slot, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
@@ -1759,6 +1887,20 @@ int main(int argc, char** argv) {
         drive.d.h_dst.resize((size_t) K);
         mem_mark("the R4 hit path");
         std::fprintf(stderr, "strata generate: R4 hit path ON - resident experts are computed on the GPU\n");
+    }
+    if (n_sides == 2) {
+        // **STOPPED HERE ON PURPOSE** (`docs/DUAL-GPU.md`, "What landed").  Everything above this point is
+        // two-sided - both cards have their layers' weights, their session state and their profile-filled
+        // expert caches, and the startup lines above name them per side.  Everything below (the token graph,
+        // the verify windows, the prompt path, the drafter, the conversation checkpoints) still assumes one
+        // device, and running it on a half-loaded engine would produce plausible tokens from the wrong
+        // tensors - the exact failure mode this engine refuses everywhere else.  So: refuse, loudly.
+        std::fprintf(stderr,
+            "strata generate: --split-layers: the split's decode path is not wired to the second device yet -\n"
+            "                 refusing rather than decoding on a half-split engine. The per-side loads above\n"
+            "                 (weights, session, expert caches) are the landed part; see docs/DUAL-GPU.md for\n"
+            "                 the remaining seams: the verifier's window graphs, the prompt path, the drafter.\n");
+        return 2;
     }
     // ---- P0.S8: the routing trace.  Only meaningful with the pool running, because the ids arrive through
     // the doorbell that the pool consumes - so `--no-pool` is refused rather than silently producing an empty

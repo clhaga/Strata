@@ -35,6 +35,11 @@
 
 namespace strata::core {
 
+/// The index's tensor NAMES, in file order.  A dual-GPU layer split builds its "every tensor of the layers I
+/// do not own" skip set from this (`docs/DUAL-GPU.md`); it lives beside the loader so the flat index format
+/// is parsed in one place only - a third parser is a third way to disagree about an offset.
+bool index_names(const std::string& pack_dir, std::vector<std::string>& out, std::string& err);
+
 /// What the loader had to DO for a tensor, decided by `tools/pack_index.py` and written into the index
 /// rather than inferred here.  The four cases are distinguishable in the manifest only by combining
 /// `source_type` with `values_fp16`, and getting that combination wrong yields a plausible tensor.

@@ -30,10 +30,18 @@ namespace strata::core {
 struct SessionState {
     int64_t max_cells = 0;
 
+    /// **DUAL-GPU (`docs/DUAL-GPU.md`): THE LAYER RANGE THIS STATE COVERS.**  `[0, n_layers)` is the whole
+    /// model and the historic only case; a split gives side 0 `[0, N)` and side 1 `[N, n_layers)`, each with
+    /// its own arena, its own GDN/QSA state for ITS layers and its own copy of the RoPE table.  Everything
+    /// that walks layers by index (`gdn_point_at`, the capture loops, the replays) counts in-range, and the
+    /// doorbell's ring counter keeps its GLOBAL layer numbering so the host protocol is unchanged.
+    int64_t layer_begin = 0;
+    int64_t layer_end = 0;
+
     GdnBuffers gdn;                 ///< the 36 GDN layers share one set of scratch; their STATE is per layer
     float* gdn_state = nullptr;     ///< (n_gdn_layers, gdn_state_floats)
 
-    QsaState* qsa_states = nullptr;      ///< one per QSA layer
+    QsaState* qsa_states = nullptr;      ///< one per QSA layer IN RANGE
     void* qsa_state_arena = nullptr;
     QsaBuffers qsa_bufs;                 ///< scratch, shared across the 12 (they never run concurrently)
     void* qsa_buf_arena = nullptr;
@@ -77,8 +85,18 @@ struct SessionState {
 /// requires ZERO token-path allocations - a `cudaMalloc` that happened on the first token of a longer sequence
 /// would satisfy every test here and fail that one.
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k);
+/// The same sizing for a LAYER RANGE `[layer_begin, layer_end)` - one side of a dual-GPU split.  The per-token
+/// scratch (block, MoE, GDN/QSA buffers) is geometry-sized and duplicated per side; only the per-layer STATE
+/// shrinks with the range.  The RoPE table goes to whichever in-range QSA layer is first.
+uint64_t session_bytes_range(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_begin,
+                             int64_t layer_end);
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s);
+/// `session_init` for a layer range; `s->layer_begin/layer_end` are set and every in-struct index afterwards
+/// (qsa_states order, gdn_state rows) is RANGE-LOCAL while doorbell ring values stay global.  Run it with the
+/// side's device current: the carve uploads the RoPE table and the identity page tables to THAT device.
+uint64_t session_init_range(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
+                            int64_t layer_begin, int64_t layer_end);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);
@@ -375,6 +393,10 @@ struct TokenGraph {
     cudaGraphExec_t exec = nullptr;
     bool captured = false;
     int64_t n_layers = 0;
+    /// Dual-GPU: the GLOBAL index of this graph's first layer.  The host loop waits for ring
+    /// `layer_begin + i + 1`, so a side-1 graph continues the same monotonic doorbell the side-0 graph
+    /// started, and the protocol needs no per-side reset.  0 for a whole-model graph.
+    int64_t layer_begin = 0;
     const float* y_src = nullptr;    ///< the pinned host staging the graph's H2D copies read (baked in)
     size_t parts_bytes = 0;
     int64_t calls = 0;
@@ -405,7 +427,8 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
                            const float* y_miss_host, size_t parts_bytes, TokenGraph& tg, std::string& err,
                            const TokenHits* hits = nullptr);
 bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, TokenGraph& tg,
-                       PoolFn pool, void* user, float* y_miss_host, void* stream, std::string& err);
+                       PoolFn pool, void* user, float* y_miss_host, void* stream, std::string& err,
+                       cudaEvent_t done = nullptr);
 void token_graph_free(TokenGraph& tg);
 
 }  // namespace strata::core

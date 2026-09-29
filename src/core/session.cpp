@@ -11,6 +11,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -51,12 +52,24 @@ static uint64_t ple_hist_bytes() {
 }
 
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k) {
+    return session_bytes_range(g, max_cells, k, 0, g.n_layers);
+}
+
+uint64_t session_bytes_range(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_begin,
+                             int64_t layer_end) {
+    int64_t n_gdn = 0, n_qsa = 0;
+    for (int64_t l = layer_begin; l < layer_end; ++l) {
+        if (is_qsa_layer(g, l)) ++n_qsa;
+        else ++n_gdn;
+    }
     uint64_t n = 0;
     n += gdn_buffers_bytes(g);
-    n += (uint64_t) g.n_gdn_layers() * gdn_state_floats(g) * 4;
-    // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
-    if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (g.n_qsa_layers() - 1) * qsa_state_bytes(g, max_cells, false);
+    n += (uint64_t) n_gdn * gdn_state_floats(g) * 4;
+    // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).  Per side of a
+    // split the FIRST IN-RANGE QSA layer carries its own table - duplicated, ~64 MiB, and worth it to keep the
+    // states self-contained per device.
+    if (n_qsa > 0)
+        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (n_qsa - 1) * qsa_state_bytes(g, max_cells, false);
     n += qsa_buffers_bytes(g, max_cells);
     n += moe_buffers_bytes(g, k);
     n += block_buffers_bytes(g);
@@ -65,6 +78,11 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k) {
 }
 
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s) {
+    return session_init_range(g, max_cells, k, base, s, 0, g.n_layers);
+}
+
+uint64_t session_init_range(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
+                            int64_t layer_begin, int64_t layer_end) {
     uint8_t* p = (uint8_t*) base;
     uint64_t used = 0;
     auto take = [&](uint64_t bytes) {
@@ -73,24 +91,34 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
         return r;
     };
 
+    int64_t n_gdn = 0, n_qsa = 0;
+    for (int64_t l = layer_begin; l < layer_end; ++l) {
+        if (is_qsa_layer(g, l)) ++n_qsa;
+        else ++n_gdn;
+    }
+
     s.max_cells = max_cells;
     s.k = k;
+    s.layer_begin = layer_begin;
+    s.layer_end = layer_end;
 
     gdn_buffers_init(g, take(gdn_buffers_bytes(g)), s.gdn);
-    s.gdn_state = (float*) take((uint64_t) g.n_gdn_layers() * gdn_state_floats(g) * 4);
+    s.gdn_state = (float*) take((uint64_t) n_gdn * gdn_state_floats(g) * 4);
 
-    // the 12 QSA states are separate allocations carved from one arena, because `QsaState` is a struct of
+    // the QSA states are separate allocations carved from one arena, because `QsaState` is a struct of
     // pointers and `qsa_state_init` writes them - a contiguous array would need the arena to be laid out the
     // same way, which is a coupling with nothing to gain.
     const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
-    s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (g.n_qsa_layers() - 1) * rest : 0);
-    s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()];
+    s.qsa_state_arena = take(n_qsa > 0 ? first + (uint64_t) (n_qsa - 1) * rest : 0);
+    // at least one slot even for a GDN-only range: the GDN paths hand `qsa_states[0]` down as an unused
+    // borrow (`session_capture`'s `qst`), and a null array would turn that into a dereference
+    s.qsa_states = new QsaState[(size_t) std::max<int64_t>(n_qsa, 1)]();
     s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
 
     uint8_t* qp = (uint8_t*) s.qsa_state_arena;
     // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would have the
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
-    for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
+    for (int64_t i = 0; i < n_qsa; ++i)
         if (qsa_state_init(g, max_cells, qp + (i == 0 ? 0 : first + (uint64_t) (i - 1) * rest), s.qsa_states[i],
                            i == 0 ? nullptr : &s.qsa_states[0]) == 0)
             return 0;
@@ -118,10 +146,15 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
     } else {
         cudaMemsetAsync(s.block.R, 0, (size_t) g.hc * g.n_embd * 4, cs);
     }
-    // every GDN layer's recurrence and conv history
-    cudaMemsetAsync(s.gdn_state, 0, (size_t) g.n_gdn_layers() * gdn_state_floats(g) * 4, cs);
+    // every GDN layer's recurrence and conv history - IN RANGE for a split side
+    int64_t n_gdn = 0, n_qsa = 0;
+    for (int64_t l = s.layer_begin; l < s.layer_end; ++l) {
+        if (is_qsa_layer(g, l)) ++n_qsa;
+        else ++n_gdn;
+    }
+    cudaMemsetAsync(s.gdn_state, 0, (size_t) n_gdn * gdn_state_floats(g) * 4, cs);
     // and every QSA layer's cache and indexer
-    for (int64_t i = 0; i < g.n_qsa_layers(); ++i) qsa_state_zero(s.qsa_states[i], g, stream);
+    for (int64_t i = 0; i < n_qsa; ++i) qsa_state_zero(s.qsa_states[i], g, stream);
     // **AND THE PLE'S CONV HISTORY AND TOKEN WINDOW.**  A sequence that started with a warm history would
     // convolve over rows belonging to a different sequence - the conv reads NG_HIST previous NORMALIZED rows,
     // so a stale one is a real contribution and not a zero.  The token window resets to `NG_HIST`-many nulls
@@ -134,17 +167,19 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
 }
 
 /// Sets `s.gdn.state`/`conv_state` for `layer`, which is what makes one layer's GDN state its own.  Shared by
-/// the direct and captured paths so the two cannot disagree about which slice a layer owns.
+/// the direct and captured paths so the two cannot disagree about which slice a layer owns.  The count is
+/// RANGE-LOCAL: a split side's gdn_state rows belong to its own layers only.
 void gdn_point_at(const ModelGeometry& g, int64_t layer, SessionState& s) {
     if (is_qsa_layer(g, layer)) return;
     int64_t gdn_index = 0;
-    for (int64_t l = 0; l < layer; ++l) if (!is_qsa_layer(g, l)) ++gdn_index;
+    for (int64_t l = s.layer_begin; l < layer; ++l) if (!is_qsa_layer(g, l)) ++gdn_index;
     s.gdn.state = s.gdn_state + (size_t) gdn_index * gdn_state_floats(g);
     s.gdn.conv_state = s.gdn.state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
 }
 
 /// The per-token staging every QSA layer's captured H2D reads FROM.  Must run before each replay: the graphs
 /// captured the SOURCE POINTER, not the value, and that is exactly why the buffers are pinned and fixed.
+/// Per side: each side's in-range QSA states carry their own pinned staging.
 void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s) {
     strata::kernels::QsaShapes sh = strata::kernels::qsa_real_shapes();
     sh.n_head = g.n_head;
@@ -152,8 +187,10 @@ void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionS
     sh.head_dim = g.head_dim;
     sh.idx_n_head = g.idx_q_heads;
     sh.idx_dim = g.idx_key_dim;
-    for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
-        QsaState& q = s.qsa_states[i];
+    int64_t qi = 0;
+    for (int64_t l = s.layer_begin; l < s.layer_end; ++l) {
+        if (!is_qsa_layer(g, l)) continue;
+        QsaState& q = s.qsa_states[qi++];
         qsa_step_fill(q.host_step, pos, sh);
         for (int64_t h = 0; h < g.n_head; ++h) q.host_pos[h] = (int32_t) (pos_base + pos);
     }
@@ -178,7 +215,7 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
     gr.n = 0;
 
     int64_t qsa_index = 0;
-    for (int64_t l = 0; l < g.n_layers; ++l) {
+    for (int64_t l = s.layer_begin; l < s.layer_end; ++l) {
         gdn_point_at(g, l, s);
         const bool qsa = is_qsa_layer(g, l);
         QsaState& qst = qsa ? s.qsa_states[qsa_index] : s.qsa_states[0];
@@ -246,10 +283,10 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
 
 bool session_replay(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, SessionGraphs& gr,
                     void* stream, std::string& err) {
-    if (!gr.captured || gr.n != g.n_layers) { err = "session_replay: not captured"; return false; }
+    if (!gr.captured || gr.n != s.layer_end - s.layer_begin) { err = "session_replay: not captured"; return false; }
     cudaStream_t cs = (cudaStream_t) stream;
     stage_token(g, pos, pos_base, s);
-    for (int64_t l = 0; l < g.n_layers; ++l) {
+    for (int64_t l = s.layer_begin; l < s.layer_end; ++l) {
         const cudaError_t e = cudaGraphLaunch(gr.execs[l], cs);
         if (e != cudaSuccess) {
             err = "session_replay: layer " + std::to_string(l) + ": " + cudaGetErrorString(e);
@@ -261,13 +298,13 @@ bool session_replay(const ModelGeometry& g, int64_t pos, int32_t pos_base, Sessi
 
 bool session_replay_full(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s,
                          SessionGraphs& gr, void* stream, std::string& err) {
-    if (!gr.captured || gr.n != g.n_layers || gr.posts == nullptr) {
+    if (!gr.captured || gr.n != s.layer_end - s.layer_begin || gr.posts == nullptr) {
         err = "session_replay_full: not captured with post graphs";
         return false;
     }
     cudaStream_t cs = (cudaStream_t) stream;
     stage_token(g, pos, pos_base, s);
-    for (int64_t l = 0; l < g.n_layers; ++l) {
+    for (int64_t l = s.layer_begin; l < s.layer_end; ++l) {
         // `pre[l]` then `post[l]`, in the order `session_loop` uses.  The two are ordered on one stream, and
         // `post[l]` reads what `pre[l]` wrote, so they cannot be reordered or run concurrently.
         cudaError_t e = cudaGraphLaunch(gr.execs[l], cs);
@@ -307,7 +344,7 @@ bool session_replay_stages_per_layer(const ModelGeometry& g, int64_t pos, int32_
         ~Free() { for (auto& e : *v) cudaEventDestroy(e); }
     } frees{&ev};
 
-    for (int64_t l = 0; l < n; ++l) {
+    for (int64_t l = s.layer_begin; l < s.layer_end; ++l) {
         cudaEventRecord(ev[(size_t) (l * 4 + 0)], cs);
         if (cudaGraphLaunch(gr.preA[l], cs) != cudaSuccess) { err = "stages: preA"; return false; }
         cudaEventRecord(ev[(size_t) (l * 4 + 1)], cs);
@@ -320,7 +357,7 @@ bool session_replay_stages_per_layer(const ModelGeometry& g, int64_t pos, int32_
 
     mixer_per_layer.assign((size_t) n, 0.0);
     ms_ffn = 0; ms_post = 0;
-    for (int64_t l = 0; l < n; ++l) {
+    for (int64_t l = s.layer_begin; l < s.layer_end; ++l) {
         float a = 0, b = 0, c = 0;
         cudaEventElapsedTime(&a, ev[(size_t) (l * 4 + 0)], ev[(size_t) (l * 4 + 1)]);
         cudaEventElapsedTime(&b, ev[(size_t) (l * 4 + 1)], ev[(size_t) (l * 4 + 2)]);
@@ -357,7 +394,7 @@ bool session_replay_stage_sweep(const ModelGeometry& g, int64_t pos, int32_t pos
         return false;
     }
     cudaEventRecord(a, cs);
-    for (int64_t l = 0; l < g.n_layers; ++l) {
+    for (int64_t l = s.layer_begin; l < s.layer_end; ++l) {
         const cudaError_t e = cudaGraphLaunch(gr.preP[k - 1][l], cs);
         if (e != cudaSuccess) {
             cudaEventDestroy(a);
@@ -415,7 +452,7 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
 
     double t[5] = {0, 0, 0, 0, 0};
     mixer_per_layer.assign((size_t) n, 0.0);
-    for (int64_t l = 0; l < n; ++l) {
+    for (int64_t l = s.layer_begin; l < s.layer_end; ++l) {
         // The residual as this layer receives it, before any prefix has advanced it.
         cudaMemcpyAsync(saved, s.block.R, r_floats * sizeof(float), cudaMemcpyDeviceToDevice, cs);
         for (int k = 1; k <= 5; ++k) {
@@ -434,7 +471,7 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
     if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "prefixes: final sync"; return false; }
 
     float t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0;
-    for (int64_t l = 0; l < n; ++l) {
+    for (int64_t l = s.layer_begin; l < s.layer_end; ++l) {
         float a = 0, b = 0, c = 0, d = 0, e = 0;
         cudaEventElapsedTime(&a, ev[(size_t) (l * 6 + 0)], ev[(size_t) (l * 6 + 1)]);
         cudaEventElapsedTime(&b, ev[(size_t) (l * 6 + 1)], ev[(size_t) (l * 6 + 2)]);
@@ -537,7 +574,7 @@ void SessionLoopScratch::free() {
 bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, SessionGraphs& gr,
                   PoolFn pool, HitFn hits, void* user, bool overlap, void* stream, std::string& err,
                   float* dump_layers, SessionLoopScratch* scratch) {
-    if (!gr.captured || gr.n != g.n_layers) { err = "session_loop: not captured"; return false; }
+    if (!gr.captured || gr.n != s.layer_end - s.layer_begin) { err = "session_loop: not captured"; return false; }
     if (gr.parts_dev == nullptr) { err = "session_loop: the graphs were captured without a parts buffer"; return false; }
     if (s.db == nullptr) { err = "session_loop: no doorbell; the loop has nothing to poll"; return false; }
 
@@ -619,7 +656,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
     }
     {
         const auto t0 = std::chrono::steady_clock::now();
-        const cudaError_t le = cudaGraphLaunch(gr.execs[0], cs);
+        const cudaError_t le = cudaGraphLaunch(gr.execs[s.layer_begin], cs);
         if (le != cudaSuccess) {
             err = "session_loop: launch pre[0]: " + std::string(cudaGetErrorString(le));
             return false;
@@ -628,7 +665,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         (void) t0;
     }
 
-    for (int64_t l = 0; l < g.n_layers; ++l) {
+    for (int64_t l = s.layer_begin; l < s.layer_end; ++l) {
         const auto t_launch = std::chrono::steady_clock::now();
 
         // ---- poll for the ring.  **THE DRIVER CALL IS NOW A FALLBACK, NOT THE MECHANISM.**
@@ -724,7 +761,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         // ---- and layer l+1's routing starts.  `pre[l+1]` touches none of the buffers `post[l]` reads, because
         // the two are ordered on one stream and `pre[l+1]`'s first use of `bb.mixed`/`bb.inject` is its own
         // `gr_read`, which comes after `post[l]` has consumed them.
-        if (l + 1 < g.n_layers) {
+        if (l + 1 < s.layer_end) {
             const cudaError_t ne = cudaGraphLaunch(gr.execs[l + 1], cs);
             if (ne != cudaSuccess) {
                 err = "session_loop: launch pre[" + std::to_string(l + 1) + "]: " + cudaGetErrorString(ne);
@@ -754,7 +791,7 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
     int64_t qsa_index = 0;
     int64_t gdn_index = 0;
 
-    for (int64_t l = 0; l < g.n_layers; ++l) {
+    for (int64_t l = s.layer_begin; l < s.layer_end; ++l) {
         // THE GDN LAYERS EACH GET THEIR OWN STATE, and `GdnBuffers` carries it - so the session points the
         // shared scratch at the right slice before each call.  Sharing one state across 36 layers would make
         // every layer start from the previous layer's recurrence, which produces a perfectly finite answer.
@@ -822,7 +859,7 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
     }
     int64_t qsa_index = 0;
     bool ok = true;
-    for (int64_t l = 0; l < g.n_layers && ok; ++l) {
+    for (int64_t l = s.layer_begin; l < s.layer_end && ok; ++l) {
         gdn_point_at(g, l, s);
         const bool qsa = is_qsa_layer(g, l);
         QsaState& qst = qsa ? s.qsa_states[qsa_index] : s.qsa_states[0];
@@ -863,14 +900,16 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         return false;
     }
     tg.captured = true;
-    tg.n_layers = g.n_layers;
+    tg.n_layers = s.layer_end - s.layer_begin;
+    tg.layer_begin = s.layer_begin;
     tg.y_src = y_miss_host;
     tg.parts_bytes = parts_bytes;
     return true;
 }
 
 bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, TokenGraph& tg,
-                       PoolFn pool, void* user, float* y_miss_host, void* stream, std::string& err) {
+                       PoolFn pool, void* user, float* y_miss_host, void* stream, std::string& err,
+                       cudaEvent_t done) {
     if (!tg.captured) { err = "session_run_token: not captured"; return false; }
     if (y_miss_host != tg.y_src) { err = "session_run_token: the staging buffer is not the captured one"; return false; }
     cudaStream_t cs = (cudaStream_t) stream;
@@ -887,7 +926,9 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
     volatile uint32_t* const seq = s.db->h_seq;
     volatile uint32_t* const flag = s.db->h_flag;
     using Clock = std::chrono::steady_clock;
-    for (int64_t l = 0; l < g.n_layers; ++l) {
+    // GLOBAL ring numbers: a side-1 graph continues the doorbell counter the side-0 graph left at layer_begin,
+    // so the host's expectations and the device's latched values agree without any mid-token reset.
+    for (int64_t l = tg.layer_begin; l < tg.layer_begin + tg.n_layers; ++l) {
         const uint32_t want = (uint32_t) (l + 1);
         const auto t0 = Clock::now();
         auto last_flush = t0;
@@ -924,8 +965,17 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
         tg.ms_pool += std::chrono::duration<double, std::milli>(t2 - t1).count();
     }
     progress_at("token: waiting for the GPU to finish the token");
-    const cudaError_t se = cudaStreamSynchronize(cs);
-    if (se != cudaSuccess) { err = std::string("session_run_token: ") + cudaGetErrorString(se); return false; }
+    if (done != nullptr) {
+        // DUAL-GPU: the caller owns the completion - it enqueues the boundary residual copy and the other
+        // side's graph behind this event, so the halves hand off without a host sync per side.
+        if (cudaEventRecord(done, cs) != cudaSuccess) {
+            err = std::string("session_run_token: record done: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+    } else {
+        const cudaError_t se = cudaStreamSynchronize(cs);
+        if (se != cudaSuccess) { err = std::string("session_run_token: ") + cudaGetErrorString(se); return false; }
+    }
     progress_at("decode");
     progress_beat();
     return true;

@@ -86,6 +86,23 @@ bool read_at(std::FILE* f, uint64_t off, void* dst, size_t n, std::string& err, 
 
 }  // namespace
 
+bool index_names(const std::string& pack_dir, std::vector<std::string>& out, std::string& err) {
+    const std::string path = pack_dir + "/index.txt";
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { err = "cannot open " + path; return false; }
+    char line[1024];
+    out.clear();
+    while (std::fgets(line, sizeof line, f)) {
+        if (line[0] == '#') continue;
+        char name[256] = {0};
+        if (std::sscanf(line, "%255s", name) != 1 || name[0] == '\0') continue;
+        out.emplace_back(name);
+    }
+    std::fclose(f);
+    if (out.empty()) { err = "no tensor rows in " + path; return false; }
+    return true;
+}
+
 bool WeightTable::pool_bytes(const std::string& pack_dir, uint64_t& out, std::string& err,
                              const std::set<std::string>* skip) {
     const std::string path = pack_dir + "/index.txt";
