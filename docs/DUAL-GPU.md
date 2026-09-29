@@ -41,13 +41,13 @@ which cuts the exposed CPU expert term (`expert_cache.hpp:3`, the largest single
 5. **`prefill.{cpp,hpp}` - LANDED.** The chunk loop walks `[ss.layer_begin, ss.layer_end)`; the
    expert-stream pre-pass emits only this side's layers (foreign seq spans empty); the GDN-hash debug
    reads this side's state rows. NO run_one_chunk extraction was needed: `on_chunk` already fires per
-   chunk with the stream synchronized, so the split runs the sides SEQUENTIALLY per prompt - side 0's
-   `on_chunk` stashes each chunk's final `m.R` (T x hc*n_embd, ~160 KB at T=4... at prefill T is the
-   chunk, e.g. 8192 x 40 KB = 320 MB per chunk STASHED TO PINNED HOST) and side 1 loads it via
-   `set_external_r(stash, max_chunk)` instead of computing the embedding broadcast. Boundary = `m.R`
-   only (prefill's unfused halves fold within the layer). The driver wires `on_chunk` (MTP feed) to
-   SIDE 1'S instance only; side 1's `ple_on` is naturally false (its ss.ple is not wired).
-   NOTE for the driver: the stash is per-chunk, sized n_chunks x max_chunk x hc x n_embd floats. `for l in 0..n_layers` at `prefill.cpp:855` with
+   chunk with the stream synchronized, and `run(tokens, n, pos0, err)` accepts any token range - so the
+   split INTERLEAVES per chunk with no stash-per-chunk: side 0's `on_chunk` copies the chunk's final
+   `m.R` (T x hc*n_embd - 320 MB at an 8192 chunk, so ONE reusable pinned buffer, not a per-chunk
+   stash) to host, calls `pf1.set_external_r(buf, T)`, then `pf1.run(tokens + c0, T, p0, err)` - one
+   chunk per call. Boundary = `m.R` only (prefill's unfused halves fold within the layer). The driver
+   wires `on_chunk` (MTP feed + PP progress + checkpoints) to SIDE 1'S instance only, where R is the
+   final residual; side 1's `ple_on` is naturally false (its ss.ple is not wired). `for l in 0..n_layers` at `prefill.cpp:855` with
    `gdn_index`/`qsa_index` locals, `ss.gdn_state + gdn_index*gdn_floats`, `ss.qsa_states[qsa_index]`,
    weights via `LayerView(*m.wt, l)`, chunk activations in `m.R` (T rows x hc*n_embd); the embeddings
    broadcast into `m.R` happens just before the loop (~:758)). Split = the same shape as the verifier:
