@@ -2945,8 +2945,15 @@ int main(int argc, char** argv) {
             return ver.commit(n_keep, e);
         };
         cudaStream_t adapt_stream = nullptr;
-        if (cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
-            std::fprintf(stderr, "strata serve: cannot create the refill stream\n");
+        // DUAL-GPU: the adaptive tier is single-side only (its swap path is not side-aware, so `usage` is
+        // empty in a split) - creating its stream anyway once failed on a WDDM box whose driver resources
+        // were already stretched, for a stream nothing would ever use.  Single-side keeps the strict check.
+        if (n_sides > 1) {
+            (void) cudaGetLastError();   // clear anything sticky, so a later checked call reports only itself
+        } else if (cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
+            const cudaError_t se = cudaGetLastError();
+            std::fprintf(stderr, "strata serve: cannot create the refill stream: %s (sticky: %s)\n",
+                         cudaGetErrorString(se), cudaGetErrorString(se));
             return 1;
         }
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
