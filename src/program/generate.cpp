@@ -1752,7 +1752,7 @@ int main(int argc, char** argv) {
         uint64_t used = 0;
         size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
-        for (const auto& pr : profile) {
+        for (const auto& pr : prof_side) {   // THIS SIDE'S ranked pairs - the fill fills these, in this order
             const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
             if (used + b > cap) break;
             used += b;

@@ -256,6 +256,22 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         err = "ExpertCache::fill_slot_blocking: the host blob is null";
         return false;
     }
+    // THE SLOT'S OWN CAPACITY, when the slots differ in size: `n` is clamped to the LARGEST blob, so a
+    // mismatched (slot, blob) pair would memcpy past this slot INTO THE NEXT ONE - silent corruption that
+    // first showed up as an invalid argument at the LAST slot (dual-GPU: the sizing loop and the fill loop
+    // disagreed about the list).  Refuse loudly instead; the clamp to `blob_` stays for uniform slots.
+    if (off_.size() > (size_t) slot + 1) {
+        const uint64_t span = off_[(size_t) slot + 1] - off_[(size_t) slot];
+        if ((uint64_t) n > span) {
+            char buf[256];
+            std::snprintf(buf, sizeof buf,
+                          "ExpertCache::fill_slot_blocking: %llu B into a %llu B slot (slot %d of %lld) - the "
+                          "slot list and the fill list disagree",
+                          (unsigned long long) n, (unsigned long long) span, (int) slot, (long long) slots_);
+            err = buf;
+            return false;
+        }
+    }
     const cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
     if (e != cudaSuccess) {
         // WHAT THE COPY ACTUALLY SAW: a dst on another device than the current one, a size past the slot,
