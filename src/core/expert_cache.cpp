@@ -258,7 +258,18 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
     }
     const cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
     if (e != cudaSuccess) {
-        err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
+        // WHAT THE COPY ACTUALLY SAW: a dst on another device than the current one, a size past the slot,
+        // or a host blob outside the arena - each of those is a different bug, and the bare code says none.
+        int dev = -1;
+        cudaGetDevice(&dev);
+        char buf[320];
+        std::snprintf(buf, sizeof buf,
+                      "ExpertCache::fill_slot_blocking: %s (slot %d of %lld, dst %p, src %p, %llu B, slot cap "
+                      "%lld B, device %d, filled %lld before this)",
+                      cudaGetErrorString(e), (int) slot, (long long) slots_, (void*) dst, (void*) host_blob,
+                      (unsigned long long) n, (long long) (off_.size() > (size_t) slot + 1 ? off_[(size_t) slot + 1] - off_[(size_t) slot] : blob_),
+                      dev, (long long) fills_);
+        err = buf;
         return false;
     }
     ++fills_;
