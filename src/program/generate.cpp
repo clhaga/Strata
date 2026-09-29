@@ -2714,6 +2714,16 @@ int main(int argc, char** argv) {
             } else if (o.prefill_auto) {
                 o.prefill_chunk = 1024;   // nothing lendable: small buffers of its own
             }
+            if (borrow == nullptr) {
+                // WHY nothing was lent, in the numbers the decision used: slots per side, what an
+                // 8192-token chunk's buffers need per side, and what the planner returned.
+                for (int s = 0; s < n_sides; ++s)
+                    std::fprintf(stderr, "strata serve: no lending: side %d has %lld slots, an 8192-token "
+                                         "chunk's buffers need %lld slots (of %.2f GiB)\n", s,
+                                 (long long) sides[s].xcache.slots(),
+                                 (long long) lend_slots(8192, s),
+                                 (double) strata::prefill::Prefill::bytes_needed(g, sides[s].ss, 8192) / 1073741824.0);
+            }
         }
         if (borrow != nullptr)
             std::fprintf(stderr, "strata serve: the prompt path borrows %lld cache slots (%.2f GiB)\n",
