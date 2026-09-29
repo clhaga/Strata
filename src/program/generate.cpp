@@ -1909,6 +1909,14 @@ int main(int argc, char** argv) {
     }
     }  // per-side expert cache
 
+    // **THE ANSWER EVERY DOWNSTREAM GATE READS.**  The per-side loop settles each side's slot count in
+    // sides[s].expert_cache; `o.expert_cache` itself stays at the REQUEST (-1 for auto) unless it is written
+    // back here - and with it stuck at -1, hit_fn and graph_hooks answer "no cache", d_res is never built,
+    // the verifier gets no residency table and the prompt path never lends: the engine fills both caches and
+    // then refuses to run.  Side 0's count is the historic meaning of the option; `any_cache()` below covers
+    // the split's "either side" case.
+    o.expert_cache = sides[0].expert_cache;
+
     // the historic names again: the code below this point predates the split and talks to side 0
     strata::core::ExpertCache& xcache = sides[0].xcache;
     auto any_cache = [&]() -> bool {
