@@ -27,6 +27,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -145,6 +148,43 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
                   std::to_string(free_b >> 20) + " of " + std::to_string(total_b >> 20) + " MiB free, asking " +
                   std::to_string(blob.size() >> 20) + " MiB (cudaMalloc: " + cudaGetErrorString(alloc) +
                   ", sticky: " + cudaGetErrorString(sticky) + ")";
+            // THE WIDER PICTURE: both devices' free memory (another process may hold the card), each one's
+            // pending error, and - the number that settles or kills the page-file theory in one line -
+            // Windows' commit charge against its limit.  A failing 110 MiB allocation with GBs of commit
+            // left and a healthy card is NOT a memory problem, and the next theory needs these numbers.
+            {
+                int n = 0;
+                if (cudaGetDeviceCount(&n) == cudaSuccess) {
+                    for (int d = 0; d < n; ++d) {
+                        int prev = 0;
+                        cudaGetDevice(&prev);
+                        if (cudaSetDevice(d) != cudaSuccess) {
+                            std::fprintf(stderr, "strata mtp diag: device %d: cudaSetDevice failed: %s\n", d,
+                                         cudaGetErrorString(cudaGetLastError()));
+                            continue;
+                        }
+                        size_t f = 0, t = 0;
+                        const cudaError_t mi = cudaMemGetInfo(&f, &t);
+                        std::fprintf(stderr, "strata mtp diag: device %d: %s, %llu of %llu MiB free\n", d,
+                                     cudaGetErrorString(mi), (unsigned long long) (f >> 20),
+                                     (unsigned long long) (t >> 20));
+                        cudaGetLastError();   // clear, so the next device starts clean
+                        cudaSetDevice(prev);
+                    }
+                }
+#if defined(_WIN32)
+                MEMORYSTATUSEX ms{};
+                ms.dwLength = sizeof ms;
+                if (GlobalMemoryStatusEx(&ms))
+                    std::fprintf(stderr, "strata mtp diag: Windows commit: %.1f of %.1f GiB used (limit = RAM + page "
+                                         "file; %.1f GiB available), RAM %.1f of %.1f GiB in use\n",
+                                 (double) (ms.totalPageFile - ms.availPageFile) / 1073741824.0,
+                                 (double) ms.totalPageFile / 1073741824.0,
+                                 (double) ms.availPageFile / 1073741824.0,
+                                 (double) (ms.ullTotalPhys - ms.ullAvailPhys) / 1073741824.0,
+                                 (double) ms.ullTotalPhys / 1073741824.0);
+#endif
+            }
             return false;
         }
         cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
