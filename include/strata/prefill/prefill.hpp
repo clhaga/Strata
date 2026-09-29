@@ -79,8 +79,18 @@ public:
     /// embedding where non-null (an image's <|image_pad|> cells).  Null (default): every position embeds its token.
     const float* const* embd_rows = nullptr;
 
+    /// DUAL-GPU (`docs/DUAL-GPU.md`): side 1 of a split runs its layers on residuals side 0 already
+    /// computed.  `stash` is PINNED HOST memory holding one row per chunk, chunk c at
+    /// `stash + c * max_chunk * hc * n_embd` floats - the driver fills it from side 0's `on_chunk`
+    /// (which fires with the stream synchronized, so a plain D2H is the whole stash step).  Set BEFORE
+    /// `run`; null (the default) computes the embedding broadcast as before.  Everything else about a
+    /// chunk - the QSA step records, `ss.ple_prev`, the residual write - is this instance's own.
+    void set_external_r(const float* stash, int64_t max_chunk) { ext_r_stash_ = stash; ext_r_chunk_ = max_chunk; }
+
 private:
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
+    const float* ext_r_stash_ = nullptr;      ///< set_external_r: pinned host, one row per chunk
+    int64_t ext_r_chunk_ = 0;                 ///< and the chunk size it was stashed with
     struct Impl;
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;

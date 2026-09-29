@@ -38,7 +38,16 @@ which cuts the exposed CPU expert term (`expert_cache.hpp:3`, the largest single
    and orchestrates the pair: `vers[0].run(...)` (syncs at its end), `vers[1].adopt_state(vers[0], T)`,
    `vers[1].run(...)` (samples and fills `out`); `commit(n_keep)` on BOTH; `set_sampling`/`set_history`/
    `set_head_sampling` on side 1 only.
-5. **`prefill.{cpp,hpp}`** (READ: the chunk forward is `for l in 0..n_layers` at `prefill.cpp:855` with
+5. **`prefill.{cpp,hpp}` - LANDED.** The chunk loop walks `[ss.layer_begin, ss.layer_end)`; the
+   expert-stream pre-pass emits only this side's layers (foreign seq spans empty); the GDN-hash debug
+   reads this side's state rows. NO run_one_chunk extraction was needed: `on_chunk` already fires per
+   chunk with the stream synchronized, so the split runs the sides SEQUENTIALLY per prompt - side 0's
+   `on_chunk` stashes each chunk's final `m.R` (T x hc*n_embd, ~160 KB at T=4... at prefill T is the
+   chunk, e.g. 8192 x 40 KB = 320 MB per chunk STASHED TO PINNED HOST) and side 1 loads it via
+   `set_external_r(stash, max_chunk)` instead of computing the embedding broadcast. Boundary = `m.R`
+   only (prefill's unfused halves fold within the layer). The driver wires `on_chunk` (MTP feed) to
+   SIDE 1'S instance only; side 1's `ple_on` is naturally false (its ss.ple is not wired).
+   NOTE for the driver: the stash is per-chunk, sized n_chunks x max_chunk x hc x n_embd floats. `for l in 0..n_layers` at `prefill.cpp:855` with
    `gdn_index`/`qsa_index` locals, `ss.gdn_state + gdn_index*gdn_floats`, `ss.qsa_states[qsa_index]`,
    weights via `LayerView(*m.wt, l)`, chunk activations in `m.R` (T rows x hc*n_embd); the embeddings
    broadcast into `m.R` happens just before the loop (~:758)). Split = the same shape as the verifier:
@@ -54,18 +63,7 @@ which cuts the exposed CPU expert term (`expert_cache.hpp:3`, the largest single
    cache-slot borrowing/lending (`lend_slots`/`plan_lend`/`Prefill::relayout`) becomes per side.
    The driver runs side 0's chunk then side 1's chunk per prompt chunk with the handoff between.
 
-   **THE STRUCTURAL CHANGE `run()` NEEDS** (decided, not yet done): the chunk loop body
-   (`prefill.cpp:752`'s `for (int64_t c0 = 0; c0 < n; c0 += m.T)`, ~500 lines) extracts verbatim into
-   `bool run_one_chunk(int64_t c0, int64_t n, const int32_t* tokens, ...)`; `run()` becomes a plain loop
-   over it (byte-identical behavior). The split driver then loops chunks ITSELF: `pf0.run_one_chunk`,
-   copy `m.R` (T x hc x n_embd) peer-to-peer, `pf1.run_one_chunk`. Supporting pieces: `external_R_`
-   (skip the embedding broadcast + PLE row gather - side 1's `ss.ple` is not even wired, and `ple_on`
-   reads `ss.ple.ready()` so it is naturally false there... VERIFY that `ple_on` is computed from THIS
-   side's ss), `float* R_dev()` and `int dev_` accessors (as verify.cpp's `adopt_state` does), and the
-   per-chunk expert-stream pre-pass walks (`prefill.cpp:810` `for l in 0..g.n_layers` building the ring
-   sequence, `seq_start[l]`) restricted to the side's range - `seq_start` stays n_layers+1-sized with
-   foreign layers empty.
-6. **`mtp.{cpp,hpp}`**: the drafter is placed on the last side (its `load` is already DeviceGuarded
+   6. **`mtp.{cpp,hpp}`**: the drafter is placed on the last side (its `load` is already DeviceGuarded
    there; `bind(wt, ...)` must take the last side's table and the side-1 verifier's `final_R_all()`).
 7. **`expert_source.hpp` / `ExpertDispatch`**: a second pointer set (parts/hit/cache) selected by its
    own layer counter when `split_at` is set, or one `ExpertDispatch` per side with the pool callback

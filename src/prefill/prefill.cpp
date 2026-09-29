@@ -755,6 +755,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
+        // ---- the chunk's input residual.  DUAL-GPU: side 1 of a split starts from the residual side 0 left
+        // at this chunk (stashed to pinned host by the driver between the sides) instead of the embedding
+        // broadcast, which is side 0's job - everything after this line is identical for both sides.
+        if (ext_r_stash_ != nullptr) {
+            if (cudaMemcpyAsync(m.R, ext_r_stash_ + (size_t) (c0 / ext_r_chunk_) * (size_t) ext_r_chunk_ * D,
+                                (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
+                err = "prefill: the boundary residual upload failed";
+                return false;
+            }
+        } else {
         // ---- embeddings, broadcast to the four streams
         for (int64_t t = 0; t < T; ++t) {
             const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
@@ -768,6 +778,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
         }
         gr_broadcast(m.emb, m.R, T, m.cs);
+        }
         // ---- the PLE rows of the whole chunk, one batched SSD request (read ahead on a thread, see ple_gather)
         if (ple_on) {
             const auto tp = Clock::now();
@@ -805,9 +816,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         std::vector<size_t> seq_start;
         size_t issued = 0, consumed = 0;
         if (stream_all) {
-            seq_start.resize((size_t) g.n_layers + 1);
+            // DUAL-GPU: only THIS side's layers stream through this side's ring (foreign seq spans stay empty)
+            seq_start.resize((size_t) g.n_layers + 1, 0);
             std::vector<Stager::Job> js;
-            for (int64_t l = 0; l < g.n_layers; ++l) {
+            // foreign layers' spans stay [0, 0): a side's MoE only ever asks for its own layers' entries
+            for (int64_t l = ss.layer_begin; l < ss.layer_end; ++l) {
                 seq_start[(size_t) l] = seq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
@@ -820,6 +833,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                     seq.push_back({(int32_t) l, e, b, job});
                 }
+                seq_start[(size_t) l + 1] = seq.size();
             }
             seq_start[(size_t) g.n_layers] = seq.size();
             m.stager->start(std::move(js));
@@ -852,7 +866,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
         };
         if (stream_all) issue_until((size_t) m.ring);   // layer 0's first experts, behind the embedding and the PLE
-        for (int64_t l = 0; l < g.n_layers; ++l) {
+        for (int64_t l = ss.layer_begin; l < ss.layer_end; ++l) {   // DUAL-GPU: this side's layers
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             const core::LayerView v(*m.wt, l);
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
@@ -1406,8 +1420,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         std::vector<uint8_t> b((size_t) gdn_floats * 4);
         std::string line;
         char h[8];
-        for (int64_t i = 0; i < g.n_gdn_layers(); ++i) {
-            cudaMemcpy(b.data(), ss.gdn_state + (size_t) i * gdn_floats, b.size(), cudaMemcpyDeviceToHost);
+        for (int64_t l = ss.layer_begin, i = 0; l < ss.layer_end; ++l) {
+            if (core::is_qsa_layer(g, l)) continue;
+            cudaMemcpy(b.data(), ss.gdn_state + (size_t) i++ * gdn_floats, b.size(), cudaMemcpyDeviceToHost);
             uint64_t x = 1469598103934665603ull;
             for (uint8_t c : b) x = (x ^ c) * 1099511628211ull;
             std::snprintf(h, sizeof(h), "%04llx ", (unsigned long long) (x & 0xffff));
