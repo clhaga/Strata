@@ -31,17 +31,32 @@ which cuts the exposed CPU expert term (`expert_cache.hpp:3`, the largest single
 
 ## What remains, in order, with the seams
 
-4. **`verify.{cpp,hpp}` - the production decode path for native packs.** `Verifier::init(wt, g, ss, hits,
+4. **`verify.{cpp,hpp}` - LANDED (commit a59f1cd).** Two `Verifier` instances, one per side;
+   `set_input_external()` + `adopt_state(prev, T)` carry the boundary (`R_`, `bo_`, `inj2_`); the head/
+   sampling/`out` exist only on the last side; `run()`'s pool callback still receives the GLOBAL layer
+   number. What remains HERE: nothing inside verify.cpp - the generate.cpp driver (item 8) instantiates
+   and orchestrates the pair. `Verifier::init(wt, g, ss, hits,
    head, spec, err)` and `record_window` assume one device. Split: record the window per side into two
    `exec_[T]` tables (capture stream per side), `run()` launches side 0's half, serves its rings/pool/
    flags, then `cudaEventRecord` on side 0's stream + `cudaStreamWaitEvent` on side 1's + a peer copy of
    the window's `R` (T rows x hc x n_embd) + side 1's half. The `VerifyHits` (d_res/cache_base/hit
    buffers) become per side; `emb_` stays side 0; `R_`/sampler/logits on side 1; `commit()` per side.
    The doorbell/flag protocol needs no change - seq is global and the halves are device-serialized.
-5. **`prefill.{cpp,hpp}`**: `Prefill::init` per side (its own `wt`/`ss`/`xcache`/stream/cuBLAS handle/
-   staging ring - the ring streams only its side's experts over its own PCIe link, which is where TTFT
-   improves); the chunk loop runs `[begin, end)` with one residual cross-copy at the boundary; the
-   cache-slot borrowing/lending becomes per side (`lend_slots`/`plan_lend` over the owning cache).
+5. **`prefill.{cpp,hpp}`** (READ: the chunk forward is `for l in 0..n_layers` at `prefill.cpp:855` with
+   `gdn_index`/`qsa_index` locals, `ss.gdn_state + gdn_index*gdn_floats`, `ss.qsa_states[qsa_index]`,
+   weights via `LayerView(*m.wt, l)`, chunk activations in `m.R` (T rows x hc*n_embd); the embeddings
+   broadcast into `m.R` happens just before the loop (~:758)). Split = the same shape as the verifier:
+   a layer range on `Prefill` (from `ss.layer_begin/end`), `gdn_index`/`qsa_index` counting IN RANGE,
+   the loop over `[begin, end)`, the embedding+broadcast only on side 0, and a boundary handoff of
+   `m.R` (T x hc x n_embd) between side 0's last layer and side 1's first - confirm against the MoE/
+   residual tail of the loop (~:1035-1200, unread) whether anything else crosses (the verifier needed
+   `bo_`/`inj2_` because its FUSED gr path defers the FFN fold; prefill's unfused `gr_norm`/`gr_mix`
+   halves look like they fold within the layer). `Prefill::init` gets one instance per side (its own
+   `wt`/`ss`/`xcache`/stream/cuBLAS `gemm.init_external`/staging ring - the ring streams only its
+   side's experts over its own PCIe link, which is where TTFT improves); `on_chunk` (the MTP prefill
+   feed) wires to SIDE 1'S instance only - it must see the residual AFTER side 1's layers; the
+   cache-slot borrowing/lending (`lend_slots`/`plan_lend`/`Prefill::relayout`) becomes per side.
+   The driver runs side 0's chunk then side 1's chunk per prompt chunk with the handoff between.
 6. **`mtp.{cpp,hpp}`**: the drafter is placed on the last side (its `load` is already DeviceGuarded
    there; `bind(wt, ...)` must take the last side's table and the side-1 verifier's `final_R_all()`).
 7. **`expert_source.hpp` / `ExpertDispatch`**: a second pointer set (parts/hit/cache) selected by its
