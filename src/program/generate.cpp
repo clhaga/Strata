@@ -1262,6 +1262,17 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: dual-GPU: layers [0, %d) on device 0, [%d, %lld) on device 1\n",
                      o.split_layers, o.split_layers, (long long) n_layers_total);
+        // THE GROUND TRUTH ABOUT WHAT CUDA SEES, BY NAME AND VRAM: the iGPUs of Device Manager never appear
+        // here (CUDA enumerates NVIDIA hardware only), so this line settles any labelling question outright.
+        for (int d = 0; d < visible; ++d) {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, d) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: dual-GPU: visible device %d: properties unavailable\n", d);
+                continue;
+            }
+            std::fprintf(stderr, "strata generate: dual-GPU: visible device %d: %s, %.0f MiB of VRAM (sm_%d)%\n", d,
+                         prop.name, (double) prop.totalGlobalMem / 1048576.0, prop.major * 10 + prop.minor);
+        }
         if (!o.serve) {
             // v1: the split's decode and prompt paths are wired for the SERVER loop (two verifiers, two
             // prefills, the boundary handoff); the single-shot loop still assumes one device.  Refusing
