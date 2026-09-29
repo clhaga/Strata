@@ -131,7 +131,22 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         }
         std::vector<uint8_t> blob;
         if (!read_file(rt_dir + "/dense.bin", blob)) { err = "mtp: cannot read dense.bin"; return false; }
-        if (cudaMalloc((void**) &dense_, blob.size()) != cudaSuccess) { err = "mtp: dense weights do not fit"; return false; }
+        const cudaError_t alloc = cudaMalloc((void**) &dense_, blob.size());
+        if (alloc != cudaSuccess) {
+            // THE DIAGNOSTIC THE BARE MESSAGE NEVER GAVE: which device, what it had free, what was asked,
+            // and the error code itself - an error STICKING from an earlier async call surfaces at the next
+            // CUDA call, and would otherwise read as this allocation failing for no reason.
+            int dev = -1;
+            cudaGetDevice(&dev);
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            const cudaError_t sticky = cudaGetLastError();   // clears; `alloc` if nothing earlier was pending
+            err = "mtp: dense weights do not fit: device " + std::to_string(dev) + ", " +
+                  std::to_string(free_b >> 20) + " of " + std::to_string(total_b >> 20) + " MiB free, asking " +
+                  std::to_string(blob.size() >> 20) + " MiB (cudaMalloc: " + cudaGetErrorString(alloc) +
+                  ", sticky: " + cudaGetErrorString(sticky) + ")";
+            return false;
+        }
         cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
         vram_ += blob.size();
     }
